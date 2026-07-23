@@ -2,51 +2,53 @@ package lab
 
 import "math/bits"
 
-// hashInt computes the repeatable educational hash used by both safe models.
+// hashInt вычисляет повторяемый учебный хеш, общий для обеих безопасных моделей.
 //
-// The real runtime chooses a random seed for every map and dispatches to a
-// type-specific hasher. Repeating that behaviour here would make the same key
-// jump to different groups between launches, which is inconvenient for a
-// step-by-step laboratory. A fixed seed and SplitMix64-style mixing preserve the
-// important property — well-distributed bits — while keeping every scenario
-// deterministic.
+// Настоящий runtime выбирает случайную соль для каждого экземпляра map и
+// использует хешер, зависящий от типа ключа. Если точно повторить это поведение в
+// лаборатории, один и тот же ключ будет попадать в разные группы между
+// запусками, что мешает пошаговому изучению. Фиксированная соль и перемешивание в
+// стиле SplitMix64 сохраняют важное свойство — равномерное распределение битов —
+// и при этом делают каждый сценарий детерминированным.
 func hashInt(key MapKey, seed HashSeed) FullHash {
-	// Convert through int64 so negative int keys keep their two's-complement bit
-	// pattern when widened to uint64.
+	// Преобразование проходит через int64, чтобы отрицательный int сохранил своё
+	// дополнительное представление при расширении до uint64.
 	x := uint64(int64(key)) + seed + 0x9e3779b97f4a7c15
 
-	// The xor-shift/multiply rounds spread a small change in the key across the
-	// whole 64-bit result. The constants are mixing constants, not map metadata.
+	// Раунды xor-сдвига и умножения распространяют небольшое изменение ключа на
+	// весь 64-битный результат. Эти числа — константы перемешивания, а не
+	// служебные данные map.
 	x ^= x >> 30
 	x *= 0xbf58476d1ce4e5b9
 	x ^= x >> 27
 	x *= 0x94d049bb133111eb
 	x ^= x >> 31
 
-	// A final rotation makes the chosen high/low split easier to demonstrate
-	// without changing the amount of information in the hash.
+	// Финальный циклический сдвиг делает выбранное разделение на старшую и младшую
+	// части удобнее для демонстрации, не теряя информацию хеша.
 	return bits.RotateLeft64(x, 17)
 }
 
-// h1 returns the part of the hash used for routing and probing.
+// h1 возвращает часть хеша, которая используется для маршрутизации и probing.
 //
-// Swiss Table reserves the lower seven bits for H2, therefore H1 is everything
-// above them. It chooses the initial group and then participates in the probe
-// sequence when collisions occur.
+// Swiss Table оставляет младшие семь бит под H2, поэтому H1 — это все остальные
+// старшие биты. Они выбирают начальную группу и участвуют в построении
+// последовательности проб при коллизиях.
 func h1(hash FullHash) ProbeHash {
 	return hash >> 7
 }
 
-// h2 returns the seven-bit fingerprint stored in a full slot's control byte.
+// h2 возвращает семибитный отпечаток, который хранится в control byte занятого
+// слота.
 //
-// Comparing eight H2 values is cheaper than comparing eight complete keys. Only
-// slots whose fingerprint matches become candidates for a full key comparison.
+// Сравнить восемь значений H2 дешевле, чем восемь полных ключей. Полное сравнение
+// выполняется только для слотов, чей отпечаток совпал.
 func h2(hash FullHash) ControlFingerprint {
 	return ControlFingerprint(hash & 0x7f)
 }
 
-// bitString formats the lowest width bits as a fixed-width binary prefix for
-// the directory visualization.
+// bitString выводит младшие width бит как двоичную строку фиксированной ширины
+// для визуализации директории.
 func bitString(value, width int) string {
 	if width == 0 {
 		return "—"
