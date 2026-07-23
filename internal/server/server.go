@@ -1,5 +1,5 @@
-// Package server connects the safe simulations and unsafe inspector to a small
-// local HTTP API, then serves the embedded educational interface.
+// Package server связывает безопасные модели и unsafe-инспектор с небольшим
+// локальным HTTP API, а затем раздаёт встроенный учебный интерфейс.
 package server
 
 import (
@@ -17,17 +17,19 @@ import (
 	"go-map-internals-lab/internal/lab"
 )
 
-// staticFiles contains the browser interface at compile time, so the finished
-// binary does not depend on a working directory or external asset files.
+// staticFiles содержит браузерный интерфейс прямо внутри собранного бинарного
+// файла. Поэтому приложение не зависит от текущей рабочей директории и наличия
+// внешних HTML/CSS/JavaScript-файлов рядом с исполняемым файлом.
 //
 //go:embed static/*
 var staticFiles embed.FS
 
-// application owns the mutable state of all three laboratory modes.
+// application владеет изменяемым состоянием всех трёх режимов лаборатории.
 //
-// HTTP handlers may run concurrently. The models themselves intentionally do
-// not contain locks because concurrency is not the subject of their algorithms;
-// application.mu serializes every read and mutation at the server boundary.
+// HTTP-обработчики могут выполняться параллельно. Сами модели намеренно не
+// содержат блокировок, потому что конкурентный доступ не относится к изучаемым
+// алгоритмам. application.mu последовательно пропускает каждое чтение и
+// изменение на границе HTTP-сервера.
 type application struct {
 	mu sync.Mutex
 
@@ -35,14 +37,14 @@ type application struct {
 	legacy *lab.Legacy
 	real   *inspector.Lab
 
-	// swissMaxTable remembers the currently selected teaching limit across
-	// resets. The real runtime limit is larger; a small value makes split easy
-	// to reach from the interface.
+	// swissMaxTable запоминает выбранный учебный предел таблицы между сбросами.
+	// В настоящем runtime предел больше, но маленькое значение позволяет быстро
+	// добраться до split через интерфейс.
 	swissMaxTable lab.TableCapacity
 }
 
-// request is the common JSON envelope accepted by operation, reset and scenario
-// endpoints. Each handler reads only the fields relevant to its command.
+// request — общая JSON-оболочка для запросов operation, reset и scenario.
+// Каждый обработчик читает только те поля, которые относятся к его команде.
 type request struct {
 	Mode             lab.SimulationMode `json:"mode"`
 	Kind             lab.OperationKind  `json:"kind"`
@@ -52,10 +54,11 @@ type request struct {
 	MaxTableCapacity lab.TableCapacity  `json:"maxTableCapacity"`
 }
 
-// New assembles the complete local application as an http.Handler.
+// New собирает всё локальное приложение и возвращает его как http.Handler.
 //
-// Returning a handler instead of starting a listener keeps transport setup in
-// main and makes the whole API testable through net/http/httptest.
+// Функция возвращает обработчик, а не запускает сетевой listener самостоятельно.
+// Благодаря этому транспортные настройки остаются в main, а весь API можно
+// проверять через net/http/httptest.
 func New() http.Handler {
 	const defaultTeachingTableCapacity lab.TableCapacity = 32
 
@@ -77,7 +80,7 @@ func New() http.Handler {
 	return securityHeaders(mux)
 }
 
-// state returns a read-only snapshot of the selected implementation.
+// state возвращает снимок выбранной реализации, не изменяя её состояние.
 func (a *application) state(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -86,8 +89,8 @@ func (a *application) state(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.snapshot(mode))
 }
 
-// operation applies one insert, read or delete command and returns the resulting
-// complete snapshot.
+// operation применяет одну команду insert, read или delete и возвращает полный
+// снимок получившегося состояния.
 func (a *application) operation(w http.ResponseWriter, r *http.Request) {
 	var input request
 	if err := decodeRequest(r, &input); err != nil {
@@ -115,7 +118,7 @@ func (a *application) operation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
-// reset replaces the selected model with a fresh empty instance.
+// reset заменяет выбранную модель новым пустым экземпляром.
 func (a *application) reset(w http.ResponseWriter, r *http.Request) {
 	var input request
 	if err := decodeRequest(r, &input); err != nil {
@@ -145,9 +148,9 @@ func (a *application) reset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.snapshot(input.Mode))
 }
 
-// scenario prepares a deterministic state that would otherwise require many
-// manual clicks. Every scenario still uses the same public Apply operation as a
-// user action; it does not mutate internal fields behind the model's back.
+// scenario подготавливает детерминированное состояние, до которого вручную
+// пришлось бы доходить множеством нажатий. Сценарий всё равно использует обычный
+// публичный метод Apply и не изменяет внутренние поля модели в обход её API.
 func (a *application) scenario(w http.ResponseWriter, r *http.Request) {
 	var input request
 	if err := decodeRequest(r, &input); err != nil {
@@ -170,7 +173,8 @@ func (a *application) scenario(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
-// prepareLegacyScenario inserts pairs until an active, observable grow appears.
+// prepareLegacyScenario добавляет пары, пока не начнётся активный и заметный в
+// интерфейсе grow.
 func (a *application) prepareLegacyScenario(scenario lab.ScenarioName) lab.Snapshot {
 	a.legacy = lab.NewLegacy()
 	limit := 60
@@ -192,9 +196,9 @@ func (a *application) prepareLegacyScenario(scenario lab.ScenarioName) lab.Snaps
 	return snapshot
 }
 
-// prepareRealRuntimeScenario grows a genuine map until its physical shape
-// changes. The exact key count is runtime-dependent, therefore shape rather than
-// a hard-coded threshold is the stopping condition.
+// prepareRealRuntimeScenario увеличивает настоящую map, пока не изменится её
+// физическая форма. Точное число ключей зависит от версии runtime, поэтому
+// условием остановки служит изменение структуры, а не жёстко заданный порог.
 func (a *application) prepareRealRuntimeScenario() lab.Snapshot {
 	a.real.Reset()
 	previousShape := ""
@@ -218,8 +222,8 @@ func (a *application) prepareRealRuntimeScenario() lab.Snapshot {
 	return snapshot
 }
 
-// prepareSwissScenario selects a small teaching limit and performs the exact
-// number of inserts needed to expose the requested milestone.
+// prepareSwissScenario выбирает небольшой учебный предел и выполняет точное
+// число записей, необходимое для демонстрации выбранного этапа роста.
 func (a *application) prepareSwissScenario(scenario lab.ScenarioName) lab.Snapshot {
 	maxTable := a.swissMaxTable
 	insertCount := 9
@@ -249,8 +253,8 @@ func (a *application) prepareSwissScenario(scenario lab.ScenarioName) lab.Snapsh
 	return snapshot
 }
 
-// snapshot delegates to the selected model. An empty or unknown mode falls back
-// to Swiss because it is the default tab in the browser.
+// snapshot передаёт получение снимка выбранной модели. Пустой или неизвестный
+// режим переключается на Swiss, потому что это вкладка по умолчанию в браузере.
 func (a *application) snapshot(mode lab.SimulationMode) lab.Snapshot {
 	switch mode {
 	case lab.ModeLegacy:
@@ -262,8 +266,9 @@ func (a *application) snapshot(mode lab.SimulationMode) lab.Snapshot {
 	}
 }
 
-// snapshotShape returns a compact structural fingerprint of the live runtime
-// map. Values are deliberately excluded: scenarios care only about grow/split.
+// snapshotShape возвращает компактный отпечаток физической структуры настоящей
+// map. Значения намеренно не учитываются: сценарию важно только событие
+// grow/split.
 func snapshotShape(snapshot lab.Snapshot) string {
 	var builder strings.Builder
 	builder.WriteString(strconv.Itoa(len(snapshot.Directory)))
@@ -274,8 +279,8 @@ func snapshotShape(snapshot lab.Snapshot) string {
 	return builder.String()
 }
 
-// isKnownOperation centralizes validation instead of scattering string
-// comparisons through handlers.
+// isKnownOperation хранит проверку допустимых операций в одном месте, чтобы не
+// разбрасывать сравнения строк по HTTP-обработчикам.
 func isKnownOperation(kind lab.OperationKind) bool {
 	switch kind {
 	case lab.OperationInsert, lab.OperationRead, lab.OperationDelete:
@@ -285,7 +290,8 @@ func isKnownOperation(kind lab.OperationKind) bool {
 	}
 }
 
-// isAllowedTeachingCapacity lists the UI-supported powers of two.
+// isAllowedTeachingCapacity перечисляет поддерживаемые интерфейсом степени
+// двойки для учебного предела таблицы.
 func isAllowedTeachingCapacity(capacity lab.TableCapacity) bool {
 	switch capacity {
 	case 16, 32, 64, 1024:
@@ -295,9 +301,9 @@ func isAllowedTeachingCapacity(capacity lab.TableCapacity) bool {
 	}
 }
 
-// decodeRequest reads one bounded JSON object and rejects unknown fields.
-// Limiting the body avoids allocating arbitrary amounts of memory even though
-// the server listens only on localhost by default.
+// decodeRequest читает один ограниченный по размеру JSON-объект и отклоняет
+// неизвестные поля. Ограничение тела не позволяет выделить произвольный объём
+// памяти, хотя по умолчанию сервер слушает только localhost.
 func decodeRequest(r *http.Request, value any) error {
 	defer r.Body.Close()
 
@@ -309,7 +315,8 @@ func decodeRequest(r *http.Request, value any) error {
 	return nil
 }
 
-// writeJSON is the single response path for successful snapshots and errors.
+// writeJSON — единая точка формирования успешных ответов и ошибок в формате
+// JSON.
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -320,7 +327,8 @@ func writeError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 }
 
-// securityHeaders applies a conservative policy suitable for the embedded UI.
+// securityHeaders добавляет консервативный набор заголовков, подходящий для
+// встроенного локального интерфейса.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
