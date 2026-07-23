@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Интерактивная лаборатория по внутреннему устройству map в Go: Swiss Table, старая эвакуация и unsafe-инспектор.">
+  <title>Go Map Lab — карта внутри map</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Go Map Lab, на главную">
+      <span class="brand-mark">m</span>
+      <span><strong>Go Map Lab</strong><small>карта внутри map</small></span>
+    </a>
+    <div class="top-actions">
+      <label class="level-toggle">
+        <input id="expert-toggle" type="checkbox">
+        <span>Подробный режим</span>
+      </label>
+      <span class="local-badge"><i></i> локально</span>
+    </div>
+  </header>
+
+  <nav class="mode-tabs" aria-label="Разделы лаборатории">
+    <button class="mode-tab active" data-mode="swiss"><span>01</span> Swiss Table <small>Go 1.24+</small></button>
+    <button class="mode-tab" data-mode="legacy"><span>02</span> Эвакуация <small>до Go 1.24</small></button>
+    <button class="mode-tab" data-mode="real"><span>03</span> Unsafe <small>живая память</small></button>
+    <button class="mode-tab" data-mode="theory"><span>04</span> Конспект <small>от азов до формул</small></button>
+  </nav>
+
+  <main>
+    <section id="lab-page">
+      <div class="hero">
+        <div>
+          <p class="eyebrow" id="mode-eyebrow">ИНТЕРАКТИВНАЯ МОДЕЛЬ</p>
+          <h1 id="mode-title">Современная map: Swiss Table</h1>
+          <p id="mode-subtitle" class="subtitle"></p>
+        </div>
+        <div class="hero-legend" aria-label="Обозначения слотов">
+          <span><i class="dot full"></i> занят</span>
+          <span><i class="dot empty"></i> empty</span>
+          <span><i class="dot deleted"></i> deleted</span>
+          <span><i class="dot changed"></i> изменён</span>
+        </div>
+      </div>
+
+      <div id="notice" class="notice"></div>
+
+      <section class="workbench" aria-label="Панель управления">
+        <div class="operation-editor">
+          <label>Операция
+            <select id="operation-kind">
+              <option value="insert">Записать m[key] = value</option>
+              <option value="read">Прочитать m[key]</option>
+              <option value="delete">Удалить delete(m, key)</option>
+            </select>
+          </label>
+          <label>Ключ
+            <input id="key-input" type="number" value="1" step="1">
+          </label>
+          <label id="value-field">Значение
+            <input id="value-input" type="number" value="10" step="1">
+          </label>
+          <button id="step-button" class="primary-button">Выполнить шаг <kbd>Enter</kbd></button>
+        </div>
+        <div class="scenario-bar">
+          <span class="scenario-label">Быстрый опыт</span>
+          <div id="scenario-buttons" class="scenario-buttons"></div>
+          <button id="auto-button" class="quiet-button">+10 записей</button>
+          <button id="reset-button" class="quiet-button danger">Сбросить</button>
+          <label id="scale-field" class="scale-field">Предел таблицы
+            <select id="scale-select">
+              <option value="16">16 · быстрый split</option>
+              <option value="32" selected>32 · учебный</option>
+              <option value="64">64 · подробнее</option>
+              <option value="1024">1024 · как runtime</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section id="stats" class="stats-grid" aria-label="Состояние заголовка map"></section>
+      <p id="scale-note" class="scale-note"></p>
+
+      <div class="learning-grid">
+        <section class="memory-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">СНИМОК ПОСЛЕ ОПЕРАЦИИ</p>
+              <h2>Память и маршрутизация</h2>
+            </div>
+            <span id="event-counter" class="counter">0 шагов</span>
+          </div>
+          <div id="memory-view" class="memory-view" aria-live="polite"></div>
+        </section>
+
+        <aside class="trace-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">ПОЧЕМУ ТАК</p>
+              <h2>Ход операции</h2>
+            </div>
+          </div>
+          <ol id="trace" class="trace-list" aria-live="polite"></ol>
+        </aside>
+      </div>
+    </section>
+
+    <article id="theory-page" class="theory-page" hidden>
+      <header class="theory-hero">
+        <p class="eyebrow">ПРАВИЛЬНАЯ МЕНТАЛЬНАЯ МОДЕЛЬ</p>
+        <h1>Две разные эпохи Go map</h1>
+        <p>Синтаксис языка не изменился, но под капотом <code>map</code> в актуальном Go устроена уже не так, как в старых статьях про <code>hmap</code> и <code>nevacuate</code>.</p>
+      </header>
+
+      <section class="correction-card">
+        <p class="card-kicker">Главное исправление исходного разбора</p>
+        <h2>Формула <code>2^(B−1)</code> не была гарантией</h2>
+        <p>В старой реализации <code>growWork</code> пытался эвакуировать целевой бакет операции и бакет <code>nevacuate</code>. Они могли совпасть, а целевой бакет мог быть уже перенесён. Поэтому одна запись гарантировала прогресс минимум на один ещё не готовый бакет, но не гарантировала два новых.</p>
+        <div class="formula-strip">
+          <span>Для N старых бакетов</span>
+          <strong>⌈N / 2⌉ ≤ изменяющих операций ≤ N</strong>
+          <small>точное число зависит от хешей записываемых ключей; чтения дают 0</small>
+        </div>
+      </section>
+
+      <section class="compare-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">СРАВНЕНИЕ</p><h2>Что именно растёт</h2></div>
+        </div>
+        <div class="compare-grid">
+          <div class="era-card modern">
+            <span class="era-tag">Go 1.24+</span>
+            <h3>Swiss Table</h3>
+            <ol>
+              <li><b>Hash</b> делится на H1 и семибитный H2.</li>
+              <li><b>Group</b> хранит 8 пар и 8 control bytes.</li>
+              <li><b>Table</b> использует quadratic probing.</li>
+              <li><b>Directory</b> верхними битами выбирает таблицу.</li>
+              <li><b>Grow</b> целой выбранной таблицы синхронен; при 1024 слотах таблица делится.</li>
+            </ol>
+          </div>
+          <div class="era-card classic">
+            <span class="era-tag">до Go 1.24 / noswissmap</span>
+            <h3>Bucket map</h3>
+            <ol>
+              <li><b>Младшие B бит</b> выбирают один bmap.</li>
+              <li><b>tophash</b> фильтрует 8 слотов бакета.</li>
+              <li><b>overflow</b> продолжает переполненный бакет.</li>
+              <li><b>oldbuckets</b> сосуществует с новым массивом.</li>
+              <li><b>growWork</b> размазывает эвакуацию по записям и удалениям.</li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <section class="calculator-card">
+        <div>
+          <p class="eyebrow">КАЛЬКУЛЯТОР СТАРОЙ ЭВАКУАЦИИ</p>
+          <h2>Оценить число операций</h2>
+          <p>Введите число бакетов в <code>oldbuckets</code> — обычно это <code>2^(B−1)</code> после обычного удвоения.</p>
+        </div>
+        <label>Старых бакетов N
+          <input id="bucket-calculator" type="number" min="1" step="1" value="8">
+        </label>
+        <div class="calculator-result">
+          <span id="calc-min">4</span><i>…</i><span id="calc-max">8</span>
+          <small>изменяющих операций</small>
+        </div>
+      </section>
+
+      <section class="deep-grid">
+        <details open>
+          <summary>Как Swiss Table ищет ключ?</summary>
+          <p>H1 выбирает первую группу. Одной битовой операцией control word сравнивает H2 сразу у восьми слотов. Только совпавшие кандидаты проходят полное сравнение ключа. Empty останавливает поиск; deleted разрешает продолжить.</p>
+        </details>
+        <details>
+          <summary>Почему удаление оставляет tombstone?</summary>
+          <p>Если группа была полной, простой empty мог бы преждевременно оборвать поиск ключа, который из-за коллизий лежит дальше. Маркер deleted говорит: «здесь пары уже нет, но probe sequence продолжается».</p>
+        </details>
+        <details>
+          <summary>Где здесь «инкрементальный» рост?</summary>
+          <p>В современной реализации одна таблица перестраивается целиком. Но большая map разделена директорией на таблицы максимум по 1024 слота, и в конкретной записи растёт только одна из них. Работа ограничена небольшой частью всей map.</p>
+        </details>
+        <details>
+          <summary>Что делает make(map[K]V, hint)?</summary>
+          <p>Hint помогает runtime заранее подобрать ёмкость и число таблиц. Это уменьшает число последующих перестроений, но hint не является жёсткой capacity и не меняет семантику map.</p>
+        </details>
+        <details>
+          <summary>Почему map не потокобезопасна?</summary>
+          <p>Параллельные запись/запись и чтение/запись без синхронизации — гонка данных. Для владения map используют mutex, передачу владения через канал или специализированный <code>sync.Map</code> в подходящих сценариях.</p>
+        </details>
+        <details>
+          <summary>Можно ли использовать unsafe-инспектор в продукте?</summary>
+          <p>Нет. Layout runtime не является публичным контрактом и меняется между версиями. Лаборатория компилирует разные инспекторы по build tags и всё равно должна считаться версионно-зависимым учебным кодом.</p>
+        </details>
+      </section>
+
+      <section class="references">
+        <p class="eyebrow">ПЕРВОИСТОЧНИКИ</p>
+        <h2>Куда смотреть дальше</h2>
+        <div class="reference-links">
+          <a href="https://go.dev/blog/swisstable" target="_blank" rel="noreferrer">Официальный разбор Swiss Tables <span>↗</span></a>
+          <a href="https://go.dev/src/internal/runtime/maps/map.go" target="_blank" rel="noreferrer">Текущий internal/runtime/maps/map.go <span>↗</span></a>
+          <a href="https://go.dev/src/internal/runtime/maps/table.go" target="_blank" rel="noreferrer">Grow, split и tombstones в table.go <span>↗</span></a>
+          <a href="https://go.dev/doc/go1.24" target="_blank" rel="noreferrer">Release notes Go 1.24 <span>↗</span></a>
+        </div>
+      </section>
+    </article>
+  </main>
+
+  <footer>
+    <span>Go Map Lab</span>
+    <span>Стандартная библиотека Go · без внешних зависимостей</span>
+  </footer>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

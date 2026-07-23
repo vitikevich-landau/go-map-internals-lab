@@ -1,0 +1,4 @@
+go-map-lab.exe
+go-map-internals-lab.exe
+*.test
+*.out
