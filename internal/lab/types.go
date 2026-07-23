@@ -53,6 +53,9 @@ type GroupIndex = int
 // BucketIndex — индекс основного legacy-бакета.
 type BucketIndex = int
 
+// BucketCount — количество основных бакетов в одном массиве legacy map.
+type BucketCount = int
+
 // OverflowIndex — номер bmap в overflow-цепочке; ноль означает основной бакет.
 type OverflowIndex = int
 
@@ -187,3 +190,17 @@ const (
 	ScenarioSplit     ScenarioName = "split"
 	ScenarioDirectory ScenarioName = "directory"
 )
+
+// LegacyGeneration — имя массива legacy-бакетов, в котором выполняется поиск
+// или который отображается в интерфейсе.
+type LegacyGeneration = string
+
+const (
+	// LegacyNewBuckets — новый активный массив buckets.
+	LegacyNewBuckets LegacyGeneration = "new"
+	// LegacyOldBuckets — старый массив oldbuckets во время эвакуации.
+	LegacyOldBuckets LegacyGeneration = "old"
+)
+
+// EvacuationReason — человекочитаемая причина выбора бакета для эвакуации.
+type EvacuationReason = string
