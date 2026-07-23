@@ -1,26 +1,27 @@
-// Package lab contains deterministic and memory-safe models of two Go map
-// implementations: the current Swiss Table and the legacy bucket map.
+// Package lab содержит детерминированные и безопасные для памяти модели двух
+// реализаций map в Go: современной Swiss Table и классической бакетной map.
 //
-// The package deliberately does not use unsafe. Reading the real runtime layout
-// is isolated in internal/inspector, so the algorithms here can be studied,
-// tested and changed without depending on a particular Go release.
+// Пакет намеренно не использует unsafe. Чтение настоящего layout runtime
+// изолировано в internal/inspector, поэтому алгоритмы здесь можно изучать,
+// проверять и изменять без привязки к конкретному выпуску Go.
 package lab
 
-// Operation describes one action requested by the user.
+// Operation описывает одну операцию, которую запросил пользователь.
 //
-// It is the common command understood by all three implementations: Swiss,
-// Legacy and the live inspector. Value is ignored for read and delete.
+// Это общая команда для всех трёх реализаций: Swiss, Legacy и живого инспектора.
+// Для чтения и удаления поле Value не используется.
 type Operation struct {
 	Kind  OperationKind `json:"kind"`
 	Key   MapKey        `json:"key"`
 	Value MapValue      `json:"value"`
 }
 
-// TraceStep is one small, human-readable stage of an operation.
+// TraceStep — один небольшой человекочитаемый этап выполнения операции.
 //
-// The browser displays TraceStep values as a timeline. A complicated insert can
-// therefore be explained as a sequence: hash the key, choose a table, probe a
-// group, compare H2 bytes, occupy a slot and possibly grow the structure.
+// Браузер показывает эти значения как временную шкалу. Поэтому сложную запись
+// можно разложить на последовательность: вычислить хеш, выбрать таблицу,
+// проверить группу, сравнить H2, занять слот и при необходимости вырастить
+// структуру.
 type TraceStep struct {
 	Phase   TracePhase `json:"phase"`
 	Title   string     `json:"title"`
@@ -30,20 +31,21 @@ type TraceStep struct {
 	Formula string     `json:"formula,omitempty"`
 }
 
-// Stat is one compact fact shown above the visualization.
+// Stat — один компактный факт, который показывается над визуализацией.
 //
-// Value is a string because the same card may contain a number, an address,
-// "nil", a fraction or a short status such as "active".
+// Value хранится строкой, потому что одна и та же карточка может содержать число,
+// адрес, nil, дробь или короткое состояние вроде «активен».
 type Stat struct {
 	Label string `json:"label"`
 	Value string `json:"value"`
 	Hint  string `json:"hint"`
 }
 
-// SlotView is the transport representation of one physical key/value slot.
+// SlotView — транспортное представление одного физического слота пары
+// «ключ → значение».
 //
-// Key and Value are pointers only so omitempty can distinguish an absent pair
-// from a real zero key or zero value.
+// Key и Value являются указателями только ради omitempty: так JSON отличает
+// отсутствующую пару от настоящего нулевого ключа или нулевого значения.
 type SlotView struct {
 	Index      SlotIndex  `json:"index"`
 	State      SlotState  `json:"state"`
@@ -54,34 +56,34 @@ type SlotView struct {
 	PhysicalID UIObjectID `json:"physicalId,omitempty"`
 }
 
-// GroupView represents one Swiss Table group of eight slots.
+// GroupView представляет одну группу Swiss Table из восьми слотов.
 //
-// ControlWord concatenates the eight control bytes in their physical order,
-// while Slots contains the decoded, browser-friendly representation.
+// ControlWord объединяет восемь control bytes в их физическом порядке, а Slots
+// содержит уже расшифрованное представление, удобное для браузера.
 type GroupView struct {
 	Index       GroupIndex `json:"index"`
 	ControlWord string     `json:"controlWord"`
 	Slots       []SlotView `json:"slots"`
 }
 
-// TableView represents one independently growing Swiss Table.
+// TableView представляет одну независимо растущую Swiss Table.
 //
-// A large Go map may contain several such tables. Multiple directory positions
-// can temporarily point at the same TableView when localDepth is smaller than
-// the map's globalDepth.
+// Большая map может содержать несколько таких таблиц. Несколько позиций
+// директории могут временно указывать на одну TableView, если localDepth меньше
+// globalDepth всей map.
 type TableView struct {
-	ID          TableID       `json:"id"`
-	Used        ElementCount  `json:"used"`
-	Capacity    TableCapacity `json:"capacity"`
-	GrowthLeft  GrowthBudget  `json:"growthLeft"`
-	Tombstones  ElementCount  `json:"tombstones"`
-	LocalDepth  HashDepth     `json:"localDepth"`
+	ID          TableID        `json:"id"`
+	Used        ElementCount   `json:"used"`
+	Capacity    TableCapacity  `json:"capacity"`
+	GrowthLeft  GrowthBudget   `json:"growthLeft"`
+	Tombstones  ElementCount   `json:"tombstones"`
+	LocalDepth  HashDepth      `json:"localDepth"`
 	DirectoryAt DirectoryIndex `json:"directoryAt"`
-	Groups      []GroupView   `json:"groups"`
+	Groups      []GroupView    `json:"groups"`
 }
 
-// DirectoryView explains how one upper-bit prefix routes an operation to a
-// Swiss Table.
+// DirectoryView показывает, как один префикс из старших битов хеша направляет
+// операцию в конкретную Swiss Table.
 type DirectoryView struct {
 	Index  DirectoryIndex `json:"index"`
 	Bits   string         `json:"bits"`
@@ -89,21 +91,22 @@ type DirectoryView struct {
 	Shared bool           `json:"shared"`
 }
 
-// BucketView is one legacy primary bucket together with its overflow chain.
+// BucketView представляет основной legacy-бакет вместе с его overflow-цепочкой.
 //
-// Chain[0] is the primary bmap; subsequent entries are overflow bmaps reached by
-// following the runtime-style overflow link.
+// Chain[0] — основной bmap. Последующие элементы — overflow-bmap, достижимые по
+// ссылкам, похожим на ссылки внутри runtime.
 type BucketView struct {
 	Index     BucketIndex  `json:"index"`
 	Evacuated bool         `json:"evacuated"`
 	Chain     [][]SlotView `json:"chain"`
 }
 
-// LegacyView contains the arrays that may coexist during incremental growth.
+// LegacyView содержит массивы бакетов, которые могут одновременно существовать
+// во время инкрементального роста.
 //
-// NewBuckets is always present. OldBuckets exists only while evacuation is in
-// progress; Nevacuate points at the next old bucket that must be processed in
-// order.
+// NewBuckets присутствует всегда. OldBuckets существует только во время
+// эвакуации, а Nevacuate указывает на следующий старый бакет, который нужно
+// последовательно обработать.
 type LegacyView struct {
 	B              HashDepth    `json:"B"`
 	NewBuckets     []BucketView `json:"newBuckets"`
@@ -113,17 +116,17 @@ type LegacyView struct {
 	Growing        bool         `json:"growing"`
 }
 
-// Snapshot is the complete serializable state consumed by the browser.
+// Snapshot — полное сериализуемое состояние, которое получает браузер.
 //
-// The same envelope is used for the safe Swiss model, safe legacy model and
-// unsafe inspector. Fields irrelevant to the selected mode remain empty and are
-// omitted from JSON where appropriate.
+// Одна и та же оболочка используется для безопасной Swiss-модели, безопасной
+// legacy-модели и unsafe-инспектора. Поля, не относящиеся к выбранному режиму,
+// остаются пустыми и при необходимости исключаются из JSON.
 type Snapshot struct {
-	Mode       SimulationMode `json:"mode"`
-	Title      string         `json:"title"`
-	Subtitle   string         `json:"subtitle"`
-	Notice     string         `json:"notice"`
-	Stats      []Stat         `json:"stats"`
+	Mode       SimulationMode  `json:"mode"`
+	Title      string          `json:"title"`
+	Subtitle   string          `json:"subtitle"`
+	Notice     string          `json:"notice"`
+	Stats      []Stat          `json:"stats"`
 	Directory  []DirectoryView `json:"directory,omitempty"`
 	Tables     []TableView     `json:"tables,omitempty"`
 	Legacy     *LegacyView     `json:"legacy,omitempty"`
@@ -132,10 +135,10 @@ type Snapshot struct {
 	ScaleNote  string          `json:"scaleNote,omitempty"`
 }
 
-// intPtr returns a pointer to a copy of value.
+// intPtr возвращает указатель на копию value.
 //
-// Snapshot fields use pointers so JSON can omit an absent key/value while still
-// preserving the legitimate numeric value zero.
+// Поля Snapshot используют указатели, чтобы JSON мог пропустить отсутствующий
+// ключ или значение, но при этом сохранить допустимое числовое значение 0.
 func intPtr(value int) *int {
 	v := value
 	return &v
