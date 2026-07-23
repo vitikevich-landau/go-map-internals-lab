@@ -1,9 +1,9 @@
-// Go Map Lab is a local educational web application about Go map internals.
+// Go Map Lab — локальное учебное веб-приложение о внутреннем устройстве map в Go.
 //
-// The executable deliberately contains almost no business logic. main only
-// reads process-level configuration, assembles the HTTP server and starts the
-// listener. The map algorithms live in internal/lab, unsafe memory inspection
-// lives in internal/inspector, and HTTP routing lives in internal/server.
+// В исполняемом пакете почти нет логики предметной области. Функция main только
+// читает настройки процесса, собирает HTTP-сервер и запускает прослушивание порта.
+// Алгоритмы map находятся в internal/lab, unsafe-инспекция памяти — в
+// internal/inspector, а HTTP-маршрутизация — в internal/server.
 package main
 
 import (
@@ -16,28 +16,30 @@ import (
 	"go-map-internals-lab/internal/server"
 )
 
-// ServerAddress is the local TCP address accepted by http.Server.
-// It is a semantic alias: the underlying value is still a regular string.
+// ServerAddress — локальный TCP-адрес, на котором работает http.Server.
+// Это смысловой псевдоним: базовым типом по-прежнему остаётся обычная строка.
 type ServerAddress = string
 
-// HeaderReadTimeout limits how long a client may spend sending HTTP headers.
+// HeaderReadTimeout — максимальное время, которое клиент может потратить на
+// отправку HTTP-заголовков.
 type HeaderReadTimeout = time.Duration
 
 const defaultHeaderReadTimeout HeaderReadTimeout = 5 * time.Second
 
 func main() {
-	// Bind to loopback by default: this laboratory is intended to be opened from
-	// the same computer, not exposed as a production web service.
+	// По умолчанию сервер привязывается к loopback-интерфейсу. Лаборатория
+	// предназначена для запуска на том же компьютере, а не для публикации как
+	// производственный веб-сервис.
 	address := flag.String(
 		"addr",
 		"127.0.0.1:8080",
-		"address for the local web interface",
+		"адрес локального веб-интерфейса",
 	)
 	flag.Parse()
 
-	// server.New returns an http.Handler rather than starting its own listener.
-	// That keeps process concerns here and makes the application independently
-	// testable with httptest in internal/server.
+	// server.New возвращает http.Handler, но сам не открывает сетевой порт.
+	// Благодаря этому настройки процесса остаются в main, а приложение можно
+	// независимо проверять через httptest в пакете internal/server.
 	handler := server.New()
 	httpServer := &http.Server{
 		Addr:              ServerAddress(*address),
@@ -48,8 +50,8 @@ func main() {
 	fmt.Printf("\nGo Map Lab запущен: http://%s\n", *address)
 	fmt.Println("Остановить: Ctrl+C")
 
-	// ListenAndServe normally returns http.ErrServerClosed during a graceful
-	// shutdown. Any other error means the listener could not continue.
+	// При штатном завершении ListenAndServe возвращает http.ErrServerClosed.
+	// Любая другая ошибка означает, что сервер не смог продолжить работу.
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
