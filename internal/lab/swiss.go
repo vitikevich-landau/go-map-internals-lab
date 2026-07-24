@@ -6,85 +6,143 @@ import (
 )
 
 const (
-	groupSlots  = 8
-	ctrlEmpty   = byte(0x80)
-	ctrlDeleted = byte(0xfe)
+	// swissGroupSlots — физическое число слотов в одной группе Swiss Table.
+	// Значение является частью устройства алгоритма: восемь управляющих байтов
+	// проверяются вместе перед полным сравнением ключей.
+	swissGroupSlots = 8
+
+	// ctrlEmpty обозначает настоящий пустой слот. Встреча такого слота завершает
+	// поиск: ключ не мог быть записан дальше по последовательности проб.
+	ctrlEmpty ControlByte = 0x80
+
+	// ctrlDeleted обозначает tombstone. Пары в слоте уже нет, но поиск обязан идти
+	// дальше, потому что за ним могут находиться ключи из той же цепочки коллизий.
+	ctrlDeleted ControlByte = 0xfe
+
+	smallTableID TableID = "small"
 )
 
+// swissEntry — полная учебная запись, лежащая в занятом слоте.
+//
+// Hash сохраняется рядом с ключом и значением, чтобы при grow или split не
+// вычислять его повторно. В настоящем runtime детали хранения зависят от типа
+// ключа и внутренней реализации.
 type swissEntry struct {
-	Key   int
-	Value int
-	Hash  uint64
+	Key   MapKey
+	Value MapValue
+	Hash  FullHash
 }
 
+// swissSlot — один физический слот группы.
+//
+// Control всегда содержит управляющий байт, а Entry равен nil для пустого или
+// удалённого слота. Для занятого слота Control хранит H2 записи.
 type swissSlot struct {
-	Control byte
+	Control ControlByte
 	Entry   *swissEntry
 }
 
+// swissGroup — группа из восьми слотов, которые Swiss Table проверяет как один
+// блок управляющих байтов.
 type swissGroup struct {
-	Slots [groupSlots]swissSlot
+	Slots [swissGroupSlots]swissSlot
 }
 
+// swissTable — одна независимо растущая таблица внутри большой Swiss map.
+//
+// Directory может содержать несколько ссылок на один и тот же объект таблицы.
+// Это происходит, когда LocalDepth таблицы меньше globalDepth всей map.
 type swissTable struct {
 	ID         int
-	Used       int
-	Capacity   int
-	GrowthLeft int
-	LocalDepth int
-	Index      int
+	Used       ElementCount
+	Capacity   TableCapacity
+	GrowthLeft GrowthBudget
+	LocalDepth HashDepth
+	Index      DirectoryIndex
 	Groups     []swissGroup
 }
 
-// Swiss models the default Go map implementation used since Go 1.24.
+// tablePutResult объясняет результат попытки записи в конкретную таблицу.
 //
-// Real Go limits a single table to 1024 slots. The laboratory lets the UI use
-// a smaller limit so a split can be reached with a few clicks. The algorithm
-// and 7/8 load factor remain the same.
-type Swiss struct {
-	seed             uint64
-	used             int
-	small            *swissGroup
-	directory        []*swissTable
-	globalDepth      int
-	maxTableCapacity int
-	nextTableID      int
-	trace            []TraceStep
-	events           int
-	lastTargets      map[string]bool
+// completed означает, что пара записана или обновлена. reroute означает, что
+// grow/split изменил директорию и тот же хеш нужно заново направить в таблицу.
+// Структура используется вместо неочевидной пары возвращаемых bool.
+type tablePutResult struct {
+	completed bool
+	reroute   bool
 }
 
-func NewSwiss(maxTableCapacity int) *Swiss {
+// Swiss моделирует реализацию map, используемую по умолчанию начиная с Go 1.24.
+//
+// Настоящий Go ограничивает одну таблицу 1024 слотами. Лаборатория разрешает
+// выбрать меньший предел, чтобы до split можно было дойти несколькими нажатиями.
+// Сам алгоритм и предельная загрузка 7/8 при этом сохраняются.
+type Swiss struct {
+	seed HashSeed
+
+	// used — общее число живых пар во всей map, а не в одной таблице.
+	used ElementCount
+
+	// small используется, пока map умещается в одну группу из восьми слотов.
+	// В этом режиме отдельной директории и объекта таблицы ещё нет.
+	small *swissGroup
+
+	// directory направляет операцию в одну из таблиц по старшим битам хеша.
+	// Несколько элементов среза могут указывать на один *swissTable.
+	directory []*swissTable
+
+	globalDepth      HashDepth
+	maxTableCapacity TableCapacity
+	nextTableID      int
+
+	trace       []TraceStep
+	events      EventCount
+	lastTargets map[UIObjectID]bool
+}
+
+// NewSwiss создаёт пустую детерминированную модель Swiss Table.
+//
+// maxTableCapacity — учебный предел одной таблицы. Алгоритм требует степень
+// двойки: слишком маленькое значение заменяется на 16, а произвольное значение
+// не степени двойки — на безопасный учебный предел 32.
+func NewSwiss(maxTableCapacity TableCapacity) *Swiss {
 	if maxTableCapacity < 16 {
 		maxTableCapacity = 16
 	}
-	// The grow algorithm relies on powers of two.
+
+	// Маски групп и удвоение ёмкости работают только для степеней двойки.
 	if maxTableCapacity&(maxTableCapacity-1) != 0 {
 		maxTableCapacity = 32
 	}
+
 	return &Swiss{
 		seed:             0x6a09e667f3bcc909,
 		maxTableCapacity: maxTableCapacity,
 		nextTableID:      1,
-		lastTargets:      make(map[string]bool),
+		lastTargets:      make(map[UIObjectID]bool),
 		trace: []TraceStep{{
-			Phase:  "ready",
+			Phase:  TraceReady,
 			Title:  "Карта пуста",
 			Detail: "Первая запись создаст одну малую группу на 8 слотов — без директории и отдельной таблицы.",
-			Tone:   "info",
+			Tone:   TraceInfo,
 		}},
 	}
 }
 
+// Apply выполняет одну пользовательскую операцию и возвращает полный снимок.
+//
+// Перед каждой операцией очищается старая трассировка и набор подсветок, но сама
+// структура map сохраняется. Поэтому интерфейс показывает только шаги текущего
+// действия на фоне накопленного состояния.
 func (s *Swiss) Apply(op Operation) Snapshot {
 	s.trace = nil
-	s.lastTargets = make(map[string]bool)
+	s.lastTargets = make(map[UIObjectID]bool)
 	s.events++
 
 	switch op.Kind {
-	case "read":
-		s.lookup(op.Key, true)
-	case "delete":
+	case OperationRead:
+		s.read(op.Key)
+	case OperationDelete:
 		s.delete(op.Key)
 	default:
 		s.insert(op.Key, op.Value)
@@ -92,426 +150,698 @@ func (s *Swiss) Apply(op Operation) Snapshot {
 	return s.Snapshot()
 }
 
-func (s *Swiss) insert(key, value int) {
+// insert записывает новую пару либо обновляет значение существующего ключа.
+//
+// Маршрут состоит из двух режимов:
+//  1. пока map мала, работа идёт прямо с одной группой;
+//  2. после девятой новой пары хеш сначала проходит через directory.
+func (s *Swiss) insert(key MapKey, value MapValue) {
 	hash := hashInt(key, s.seed)
-	s.traceHash(key, hash, "запись")
+	s.traceHash(key, hash, OperationInsert)
 
-	if s.small == nil && len(s.directory) == 0 {
-		s.small = newSwissGroup()
-		s.trace = append(s.trace, TraceStep{
-			Phase: "allocate", Title: "Создана малая группа",
-			Detail: "Пока элементов не больше 8, Map.dirPtr указывает прямо на одну группу. Директория ещё не нужна.",
-			Tone:   "success", Target: "small-group",
-		})
-	}
-
+	s.ensureSmallGroup()
 	if s.small != nil {
-		if idx := findInGroup(s.small, key, h2(hash)); idx >= 0 {
-			s.small.Slots[idx].Entry.Value = value
-			s.mark("small", 0, idx)
-			s.trace = append(s.trace, TraceStep{
-				Phase: "update", Title: "Ключ уже существовал",
-				Detail: fmt.Sprintf("Слот %d найден по H2 и полной проверке ключа; значение заменено без роста.", idx),
-				Tone:   "success", Target: slotTarget("small", 0, idx),
-			})
+		if s.putInSmallGroup(key, value, hash) {
 			return
 		}
-		if s.used < groupSlots {
-			idx := firstAvailable(s.small)
-			s.small.Slots[idx] = swissSlot{Control: h2(hash), Entry: &swissEntry{Key: key, Value: value, Hash: hash}}
-			s.used++
-			s.mark("small", 0, idx)
-			s.trace = append(s.trace, TraceStep{
-				Phase: "insert", Title: "Запись попала в свободный слот",
-				Detail: fmt.Sprintf("Control byte слота %d теперь хранит H2 = 0x%02x. В слоте лежит пара %d → %d.", idx, h2(hash), key, value),
-				Tone:   "success", Target: slotTarget("small", 0, idx),
-			})
-			return
-		}
+
+		// Малая группа заполнена всеми восемью парами. Перед записью девятой пары
+		// существующие элементы превращаются в полноценную таблицу на 16 слотов.
 		s.growSmallToTable()
 	}
 
 	s.insertIntoDirectory(key, value, hash)
 }
 
+// ensureSmallGroup лениво выделяет первую группу.
+//
+// Пустая map не обязана заранее хранить слоты. Группа появляется только при
+// первой записи, как и small-map optimization в современном runtime.
+func (s *Swiss) ensureSmallGroup() {
+	if s.small != nil || len(s.directory) != 0 {
+		return
+	}
+
+	s.small = newSwissGroup()
+	s.trace = append(s.trace, TraceStep{
+		Phase:  TraceAllocate,
+		Title:  "Создана малая группа",
+		Detail: "Пока элементов не больше 8, Map.dirPtr указывает прямо на одну группу. Директория ещё не нужна.",
+		Tone:   TraceSuccess,
+		Target: "small-group",
+	})
+}
+
+// putInSmallGroup пытается полностью обработать запись в малом режиме.
+//
+// Возвращает true, если ключ обновлён либо пара заняла свободный слот. false
+// означает, что все восемь слотов заняты и вызывающий код должен выполнить grow.
+func (s *Swiss) putInSmallGroup(key MapKey, value MapValue, hash FullHash) bool {
+	fingerprint := h2(hash)
+
+	if slotIndex := findInGroup(s.small, key, fingerprint); slotIndex >= 0 {
+		s.small.Slots[slotIndex].Entry.Value = value
+		s.mark(smallTableID, 0, slotIndex)
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceUpdate,
+			Title:  "Ключ уже существовал",
+			Detail: fmt.Sprintf("Слот %d найден по H2 и полной проверке ключа; значение заменено без роста.", slotIndex),
+			Tone:   TraceSuccess,
+			Target: slotTarget(smallTableID, 0, slotIndex),
+		})
+		return true
+	}
+
+	if s.used >= swissGroupSlots {
+		return false
+	}
+
+	slotIndex := firstAvailable(s.small)
+	s.small.Slots[slotIndex] = swissSlot{
+		Control: ControlByte(fingerprint),
+		Entry:   &swissEntry{Key: key, Value: value, Hash: hash},
+	}
+	s.used++
+	s.mark(smallTableID, 0, slotIndex)
+	s.trace = append(s.trace, TraceStep{
+		Phase:  TraceInsert,
+		Title:  "Запись попала в свободный слот",
+		Detail: fmt.Sprintf("Управляющий байт слота %d теперь хранит H2 = 0x%02x. В слоте лежит пара %d → %d.", slotIndex, fingerprint, key, value),
+		Tone:   TraceSuccess,
+		Target: slotTarget(smallTableID, 0, slotIndex),
+	})
+	return true
+}
+
+// growSmallToTable переводит map из одной малой группы в таблицу на 16 слотов.
+//
+// Все старые пары вставляются заново, потому что число групп изменилось и H1
+// теперь выбирает физическое положение уже внутри полноценной таблицы.
 func (s *Swiss) growSmallToTable() {
 	oldEntries := groupEntries(s.small)
 	table := s.newTable(16, 0, 0)
 	for _, entry := range oldEntries {
 		s.uncheckedInsert(table, entry)
 	}
+
 	s.small = nil
 	s.directory = []*swissTable{table}
 	s.trace = append(s.trace, TraceStep{
-		Phase: "grow", Title: "Малая группа стала полноценной таблицей",
+		Phase:  TraceGrow,
+		Title:  "Малая группа стала полноценной таблицей",
 		Detail: fmt.Sprintf("Все %d старых пар синхронно перехешированы в таблицу на 16 слотов. В Go 1.24+ это происходит внутри текущей записи.", len(oldEntries)),
-		Tone:   "warning", Target: tableID(table),
+		Tone:   TraceWarning,
+		Target: tableID(table),
 	})
 }
 
-func (s *Swiss) insertIntoDirectory(key, value int, hash uint64) {
+// insertIntoDirectory повторяет маршрутизацию, пока запись не завершится.
+//
+// Повтор нужен после grow или split: директория могла начать указывать на новый
+// объект таблицы, поэтому прежний выбор по хешу больше нельзя использовать.
+func (s *Swiss) insertIntoDirectory(key MapKey, value MapValue, hash FullHash) {
 	for {
-		dirIndex := s.directoryIndex(hash)
-		table := s.directory[dirIndex]
+		directoryIndex := s.directoryIndex(hash)
+		table := s.directory[directoryIndex]
 		s.trace = append(s.trace, TraceStep{
-			Phase: "route", Title: "Директория выбрала таблицу",
-			Detail: fmt.Sprintf("Верхние %d бит хеша дают индекс %d → %s.", s.globalDepth, dirIndex, tableID(table)),
-			Tone:   "info", Target: fmt.Sprintf("dir-%d", dirIndex),
+			Phase:  TraceRoute,
+			Title:  "Директория выбрала таблицу",
+			Detail: fmt.Sprintf("Старшие %d бит хеша дают индекс %d → %s.", s.globalDepth, directoryIndex, tableID(table)),
+			Tone:   TraceInfo,
+			Target: UIObjectID(fmt.Sprintf("dir-%d", directoryIndex)),
 		})
 
-		inserted, retry := s.putInTable(table, key, value, hash)
-		if inserted {
+		result := s.putInTable(table, key, value, hash)
+		if result.completed {
 			return
 		}
-		if retry {
+		if result.reroute {
 			continue
 		}
 	}
 }
 
-// putInTable returns (done, retry). retry is true after a grow/split changed
-// the directory, because the hash must be routed again.
-func (s *Swiss) putInTable(table *swissTable, key, value int, hash uint64) (bool, bool) {
-	mask := len(table.Groups) - 1
-	offset := int(h1(hash)) & mask
-	step := 0
-	firstDeletedGroup, firstDeletedSlot := -1, -1
+// putInTable ищет ключ или свободный слот внутри одной выбранной таблицы.
+//
+// Группы посещаются по квадратичной последовательности. В каждой группе сначала
+// сравниваются восемь H2, а полные ключи проверяются только у совпавших
+// кандидатов. Первый tombstone запоминается как предпочтительное место записи,
+// но поиск продолжается до настоящего empty, чтобы не пропустить существующий
+// ключ дальше по цепочке.
+func (s *Swiss) putInTable(
+	table *swissTable,
+	key MapKey,
+	value MapValue,
+	hash FullHash,
+) tablePutResult {
+	groupMask := len(table.Groups) - 1
+	groupIndex := GroupIndex(int(h1(hash)) & groupMask)
+	probeStep := 0
+	firstDeletedGroup, firstDeletedSlot := GroupIndex(-1), SlotIndex(-1)
+	fingerprint := h2(hash)
 
-	for probes := 0; probes < len(table.Groups); probes++ {
-		group := &table.Groups[offset]
+	for probeCount := 0; probeCount < len(table.Groups); probeCount++ {
+		group := &table.Groups[groupIndex]
 		s.trace = append(s.trace, TraceStep{
-			Phase: "probe", Title: fmt.Sprintf("Проверяется группа %d", offset),
-			Detail: fmt.Sprintf("Сразу сравниваются 8 control bytes с H2 = 0x%02x. Это главный трюк Swiss Table.", h2(hash)),
-			Tone:   "info", Target: groupTarget(table, offset),
+			Phase:  TraceProbe,
+			Title:  fmt.Sprintf("Проверяется группа %d", groupIndex),
+			Detail: fmt.Sprintf("Сразу сравниваются 8 управляющих байтов с H2 = 0x%02x. Это главный приём Swiss Table.", fingerprint),
+			Tone:   TraceInfo,
+			Target: groupTarget(table, groupIndex),
 		})
 
 		for slotIndex := range group.Slots {
 			slot := &group.Slots[slotIndex]
-			if slot.Entry != nil && slot.Control == h2(hash) && slot.Entry.Key == key {
+			if slot.Entry != nil && slot.Control == ControlByte(fingerprint) && slot.Entry.Key == key {
 				slot.Entry.Value = value
-				s.mark(tableID(table), offset, slotIndex)
+				s.mark(tableID(table), groupIndex, slotIndex)
 				s.trace = append(s.trace, TraceStep{
-					Phase: "update", Title: "Совпали H2 и ключ",
-					Detail: fmt.Sprintf("Значение ключа %d обновлено в %s, группа %d, слот %d.", key, tableID(table), offset, slotIndex),
-					Tone:   "success", Target: slotTarget(tableID(table), offset, slotIndex),
+					Phase:  TraceUpdate,
+					Title:  "Совпали H2 и ключ",
+					Detail: fmt.Sprintf("Значение ключа %d обновлено в %s, группа %d, слот %d.", key, tableID(table), groupIndex, slotIndex),
+					Tone:   TraceSuccess,
+					Target: slotTarget(tableID(table), groupIndex, slotIndex),
 				})
-				return true, false
+				return tablePutResult{completed: true}
 			}
+
 			if slot.Control == ctrlDeleted && firstDeletedGroup < 0 {
-				firstDeletedGroup, firstDeletedSlot = offset, slotIndex
+				firstDeletedGroup = groupIndex
+				firstDeletedSlot = slotIndex
 			}
 		}
 
-		empty := firstEmpty(group)
-		if empty >= 0 {
+		emptySlot := firstEmpty(group)
+		if emptySlot >= 0 {
+			// GrowthLeft равен нулю, когда таблица достигла допустимой загрузки.
+			// Сначала пробуем убрать накопившиеся tombstone без увеличения ёмкости.
 			if table.GrowthLeft == 0 {
 				if s.pruneTombstones(table) {
 					s.trace = append(s.trace, TraceStep{
-						Phase: "prune", Title: "Надгробия очищены",
-						Detail: "Учебный rehash той же ёмкости убрал deleted-слоты. Реальный Go 1.25 сначала выполняет консервативный pruneTombstones и растёт, если очистки недостаточно.",
-						Tone:   "warning", Target: tableID(table),
+						Phase:  TracePrune,
+						Title:  "Надгробия очищены",
+						Detail: "Перехеширование той же ёмкости убрало deleted-слоты. После замены таблицы хеш нужно заново провести через директорию.",
+						Tone:   TraceWarning,
+						Target: tableID(table),
 					})
-					return false, true
+					return tablePutResult{reroute: true}
 				}
+
 				s.rehash(table)
-				return false, true
+				return tablePutResult{reroute: true}
 			}
 
-			targetGroup, targetSlot := offset, empty
+			targetGroup, targetSlot := groupIndex, emptySlot
 			reusedDeleted := false
 			if firstDeletedGroup >= 0 {
 				targetGroup, targetSlot = firstDeletedGroup, firstDeletedSlot
 				reusedDeleted = true
 			}
+
 			slot := &table.Groups[targetGroup].Slots[targetSlot]
-			slot.Control = h2(hash)
+			slot.Control = ControlByte(fingerprint)
 			slot.Entry = &swissEntry{Key: key, Value: value, Hash: hash}
 			table.Used++
 			s.used++
 			if !reusedDeleted {
 				table.GrowthLeft--
 			}
+
 			s.mark(tableID(table), targetGroup, targetSlot)
-			detail := fmt.Sprintf("Пара %d → %d записана в группу %d, слот %d; growthLeft теперь %d.", key, value, targetGroup, targetSlot, table.GrowthLeft)
+			detail := fmt.Sprintf(
+				"Пара %d → %d записана в группу %d, слот %d; growthLeft теперь %d.",
+				key,
+				value,
+				targetGroup,
+				targetSlot,
+				table.GrowthLeft,
+			)
 			if reusedDeleted {
 				detail += " Переиспользован deleted-слот, поэтому growthLeft не уменьшился."
 			}
 			s.trace = append(s.trace, TraceStep{
-				Phase: "insert", Title: "Найдено место для пары",
-				Detail: detail, Tone: "success", Target: slotTarget(tableID(table), targetGroup, targetSlot),
+				Phase:  TraceInsert,
+				Title:  "Найдено место для пары",
+				Detail: detail,
+				Tone:   TraceSuccess,
+				Target: slotTarget(tableID(table), targetGroup, targetSlot),
 			})
-			return true, false
+			return tablePutResult{completed: true}
 		}
 
-		step++
-		offset = (offset + step) & mask
+		// Квадратичная последовательность посещает группы со смещениями
+		// +1, +2, +3 и так далее. Маска заменяет остаток от деления, потому что
+		// число групп всегда является степенью двойки.
+		probeStep++
+		groupIndex = GroupIndex((int(groupIndex) + probeStep) & groupMask)
 	}
 
+	// Защитная ветка: если все группы просмотрены без empty, таблицу необходимо
+	// перестроить, а маршрут записи вычислить заново.
 	s.rehash(table)
-	return false, true
+	return tablePutResult{reroute: true}
 }
 
-func (s *Swiss) lookup(key int, explain bool) (*swissEntry, bool) {
+// read ищет ключ и записывает пошаговое объяснение, не изменяя map.
+func (s *Swiss) read(key MapKey) {
 	hash := hashInt(key, s.seed)
-	if explain {
-		s.traceHash(key, hash, "чтение")
-	}
-	if s.small != nil {
-		idx := findInGroup(s.small, key, h2(hash))
-		if idx >= 0 {
-			s.mark("small", 0, idx)
-			if explain {
-				s.trace = append(s.trace, TraceStep{Phase: "read", Title: "Ключ найден", Detail: fmt.Sprintf("В малой группе слот %d содержит %d → %d. Чтение ничего не перестраивает.", idx, key, s.small.Slots[idx].Entry.Value), Tone: "success", Target: slotTarget("small", 0, idx)})
-			}
-			return s.small.Slots[idx].Entry, true
-		}
-		if explain {
-			s.trace = append(s.trace, TraceStep{Phase: "read", Title: "Ключ отсутствует", Detail: "H2 или полный ключ не совпали ни в одном занятом слоте.", Tone: "warning"})
-		}
-		return nil, false
-	}
-	if len(s.directory) == 0 {
-		if explain {
-			s.trace = append(s.trace, TraceStep{Phase: "read", Title: "Карта пуста", Detail: "У пустой map нет ни группы, ни директории.", Tone: "warning"})
-		}
-		return nil, false
-	}
+	s.traceHash(key, hash, OperationRead)
+	fingerprint := h2(hash)
 
-	table := s.directory[s.directoryIndex(hash)]
-	mask := len(table.Groups) - 1
-	offset, step := int(h1(hash))&mask, 0
-	for probes := 0; probes < len(table.Groups); probes++ {
-		group := &table.Groups[offset]
-		if explain {
-			s.trace = append(s.trace, TraceStep{Phase: "probe", Title: fmt.Sprintf("Группа %d: параллельная проверка H2", offset), Detail: fmt.Sprintf("Control word сравнивается с 0x%02x; затем проверяются только кандидаты.", h2(hash)), Tone: "info", Target: groupTarget(table, offset)})
-		}
-		for i := range group.Slots {
-			slot := &group.Slots[i]
-			if slot.Entry != nil && slot.Control == h2(hash) && slot.Entry.Key == key {
-				s.mark(tableID(table), offset, i)
-				if explain {
-					s.trace = append(s.trace, TraceStep{Phase: "read", Title: "Ключ найден", Detail: fmt.Sprintf("Полное сравнение подтвердило ключ; получено значение %d. Структура map не изменилась.", slot.Entry.Value), Tone: "success", Target: slotTarget(tableID(table), offset, i)})
-				}
-				return slot.Entry, true
-			}
-		}
-		if firstEmpty(group) >= 0 {
-			if explain {
-				s.trace = append(s.trace, TraceStep{Phase: "stop", Title: "Пустой слот завершил поиск", Detail: "После настоящего empty продолжать probe sequence бессмысленно: искомого ключа дальше быть не может.", Tone: "warning"})
-			}
-			return nil, false
-		}
-		step++
-		offset = (offset + step) & mask
-	}
-	return nil, false
-}
-
-func (s *Swiss) delete(key int) {
-	hash := hashInt(key, s.seed)
-	s.traceHash(key, hash, "удаление")
 	if s.small != nil {
-		idx := findInGroup(s.small, key, h2(hash))
-		if idx < 0 {
-			s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Удалять нечего", Detail: "Ключ не найден в малой группе.", Tone: "warning"})
+		slotIndex := findInGroup(s.small, key, fingerprint)
+		if slotIndex >= 0 {
+			s.mark(smallTableID, 0, slotIndex)
+			s.trace = append(s.trace, TraceStep{
+				Phase:  TraceRead,
+				Title:  "Ключ найден",
+				Detail: fmt.Sprintf("В малой группе слот %d содержит %d → %d. Чтение ничего не перестраивает.", slotIndex, key, s.small.Slots[slotIndex].Entry.Value),
+				Tone:   TraceSuccess,
+				Target: slotTarget(smallTableID, 0, slotIndex),
+			})
 			return
 		}
-		s.small.Slots[idx] = swissSlot{Control: ctrlEmpty}
-		s.used--
-		s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Слот стал empty", Detail: "В малой map probe sequence нет, поэтому tombstone не нужен.", Tone: "success", Target: slotTarget("small", 0, idx)})
+
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceRead,
+			Title:  "Ключ отсутствует",
+			Detail: "H2 или полный ключ не совпали ни в одном занятом слоте.",
+			Tone:   TraceWarning,
+		})
 		return
 	}
+
 	if len(s.directory) == 0 {
-		s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Карта пуста", Detail: "Операция не меняет состояние.", Tone: "warning"})
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceRead,
+			Title:  "Карта пуста",
+			Detail: "У пустой map нет ни группы, ни директории.",
+			Tone:   TraceWarning,
+		})
 		return
 	}
+
 	table := s.directory[s.directoryIndex(hash)]
-	mask := len(table.Groups) - 1
-	offset, step := int(h1(hash))&mask, 0
-	for probes := 0; probes < len(table.Groups); probes++ {
-		group := &table.Groups[offset]
-		for i := range group.Slots {
-			slot := &group.Slots[i]
-			if slot.Entry != nil && slot.Control == h2(hash) && slot.Entry.Key == key {
-				slot.Entry = nil
-				table.Used--
-				s.used--
-				if firstEmpty(group) >= 0 {
-					slot.Control = ctrlEmpty
-					table.GrowthLeft++
-					s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Слот стал empty", Detail: "В группе уже был empty, значит удаление не оборвёт чужую цепочку поиска.", Tone: "success", Target: slotTarget(tableID(table), offset, i)})
-				} else {
-					slot.Control = ctrlDeleted
-					s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Оставлен tombstone", Detail: "Группа была полной: deleted сохраняет непрерывность probe sequence для ключей, лежащих дальше.", Tone: "warning", Target: slotTarget(tableID(table), offset, i)})
-				}
+	groupMask := len(table.Groups) - 1
+	groupIndex := GroupIndex(int(h1(hash)) & groupMask)
+	probeStep := 0
+
+	for probeCount := 0; probeCount < len(table.Groups); probeCount++ {
+		group := &table.Groups[groupIndex]
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceProbe,
+			Title:  fmt.Sprintf("Группа %d: параллельная проверка H2", groupIndex),
+			Detail: fmt.Sprintf("Управляющее слово сравнивается с 0x%02x; затем проверяются только совпавшие кандидаты.", fingerprint),
+			Tone:   TraceInfo,
+			Target: groupTarget(table, groupIndex),
+		})
+
+		for slotIndex := range group.Slots {
+			slot := &group.Slots[slotIndex]
+			if slot.Entry != nil && slot.Control == ControlByte(fingerprint) && slot.Entry.Key == key {
+				s.mark(tableID(table), groupIndex, slotIndex)
+				s.trace = append(s.trace, TraceStep{
+					Phase:  TraceRead,
+					Title:  "Ключ найден",
+					Detail: fmt.Sprintf("Полное сравнение подтвердило ключ; получено значение %d. Структура map не изменилась.", slot.Entry.Value),
+					Tone:   TraceSuccess,
+					Target: slotTarget(tableID(table), groupIndex, slotIndex),
+				})
 				return
 			}
 		}
+
 		if firstEmpty(group) >= 0 {
-			break
+			s.trace = append(s.trace, TraceStep{
+				Phase:  TraceStop,
+				Title:  "Пустой слот завершил поиск",
+				Detail: "После настоящего empty продолжать последовательность проб бессмысленно: искомого ключа дальше быть не может.",
+				Tone:   TraceWarning,
+			})
+			return
 		}
-		step++
-		offset = (offset + step) & mask
-	}
-	s.trace = append(s.trace, TraceStep{Phase: "delete", Title: "Ключ не найден", Detail: "Первый empty завершил поиск; карта не изменилась.", Tone: "warning"})
-}
 
-func (s *Swiss) rehash(old *swissTable) {
-	oldEntries := tableEntries(old)
-	if old.Capacity*2 <= s.maxTableCapacity {
-		replacement := s.newTable(old.Capacity*2, old.Index, old.LocalDepth)
-		moves := make([]string, 0, len(oldEntries))
-		for _, entry := range oldEntries {
-			group, slot := s.uncheckedInsert(replacement, entry)
-			moves = append(moves, fmt.Sprintf("%d→g%d/s%d", entry.Key, group, slot))
-		}
-		for i, table := range s.directory {
-			if table == old {
-				s.directory[i] = replacement
-			}
-		}
-		s.trace = append(s.trace, TraceStep{
-			Phase: "grow", Title: fmt.Sprintf("%s выросла %d → %d", tableID(old), old.Capacity, replacement.Capacity),
-			Detail: fmt.Sprintf("Вся выбранная таблица синхронно перехеширована одной записью. Перемещено %d пар: %s.", len(oldEntries), compactMoves(moves)),
-			Tone:   "warning", Target: tableID(replacement),
-		})
-		return
-	}
-	s.splitTable(old, oldEntries)
-}
-
-func (s *Swiss) splitTable(old *swissTable, entries []*swissEntry) {
-	newDepth := old.LocalDepth + 1
-	if old.LocalDepth == s.globalDepth {
-		expanded := make([]*swissTable, 0, len(s.directory)*2)
-		for _, table := range s.directory {
-			expanded = append(expanded, table, table)
-		}
-		s.directory = expanded
-		s.globalDepth++
-		s.reindexTables()
-		s.trace = append(s.trace, TraceStep{
-			Phase: "directory", Title: "Директория удвоилась",
-			Detail: fmt.Sprintf("globalDepth стал %d, поэтому теперь используются %d верхних битовых маршрутов.", s.globalDepth, len(s.directory)),
-			Tone:   "warning", Target: "directory",
-		})
+		probeStep++
+		groupIndex = GroupIndex((int(groupIndex) + probeStep) & groupMask)
 	}
 
-	left := s.newTable(s.maxTableCapacity, -1, newDepth)
-	right := s.newTable(s.maxTableCapacity, -1, newDepth)
-	for i, table := range s.directory {
-		if table != old {
-			continue
-		}
-		bit := (i >> (s.globalDepth - newDepth)) & 1
-		if bit == 0 {
-			s.directory[i] = left
-		} else {
-			s.directory[i] = right
-		}
-	}
-	s.reindexTables()
-	for _, entry := range entries {
-		table := left
-		mask := uint64(1) << (64 - newDepth)
-		if entry.Hash&mask != 0 {
-			table = right
-		}
-		s.uncheckedInsert(table, entry)
-	}
 	s.trace = append(s.trace, TraceStep{
-		Phase: "split", Title: fmt.Sprintf("%s разделилась на %s и %s", tableID(old), tableID(left), tableID(right)),
-		Detail: fmt.Sprintf("Перемещено %d пар. Верхний бит префикса определил левую или правую таблицу; старый объект таблицы больше не установлен в директории.", len(entries)),
-		Tone:   "warning", Target: "directory",
+		Phase:  TraceRead,
+		Title:  "Ключ отсутствует",
+		Detail: "Проверены все группы таблицы; полного совпадения ключа нет.",
+		Tone:   TraceWarning,
 	})
 }
 
+// delete удаляет ключ и выбирает между настоящим empty и tombstone.
+//
+// В малом режиме цепочки проб нет, поэтому слот можно сразу сделать empty. В
+// полноценной таблице удаление из полностью занятой группы обязано оставить
+// deleted, иначе поиск другого ключа может ошибочно остановиться раньше времени.
+func (s *Swiss) delete(key MapKey) {
+	hash := hashInt(key, s.seed)
+	s.traceHash(key, hash, OperationDelete)
+	fingerprint := h2(hash)
+
+	if s.small != nil {
+		slotIndex := findInGroup(s.small, key, fingerprint)
+		if slotIndex < 0 {
+			s.trace = append(s.trace, TraceStep{
+				Phase:  TraceDelete,
+				Title:  "Удалять нечего",
+				Detail: "Ключ не найден в малой группе.",
+				Tone:   TraceWarning,
+			})
+			return
+		}
+
+		s.small.Slots[slotIndex] = swissSlot{Control: ctrlEmpty}
+		s.used--
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceDelete,
+			Title:  "Слот стал empty",
+			Detail: "В малой map последовательности проб нет, поэтому tombstone не нужен.",
+			Tone:   TraceSuccess,
+			Target: slotTarget(smallTableID, 0, slotIndex),
+		})
+		return
+	}
+
+	if len(s.directory) == 0 {
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceDelete,
+			Title:  "Карта пуста",
+			Detail: "Операция не меняет состояние.",
+			Tone:   TraceWarning,
+		})
+		return
+	}
+
+	table := s.directory[s.directoryIndex(hash)]
+	groupMask := len(table.Groups) - 1
+	groupIndex := GroupIndex(int(h1(hash)) & groupMask)
+	probeStep := 0
+
+	for probeCount := 0; probeCount < len(table.Groups); probeCount++ {
+		group := &table.Groups[groupIndex]
+		for slotIndex := range group.Slots {
+			slot := &group.Slots[slotIndex]
+			if slot.Entry == nil || slot.Control != ControlByte(fingerprint) || slot.Entry.Key != key {
+				continue
+			}
+
+			slot.Entry = nil
+			table.Used--
+			s.used--
+
+			if firstEmpty(group) >= 0 {
+				slot.Control = ctrlEmpty
+				table.GrowthLeft++
+				s.trace = append(s.trace, TraceStep{
+					Phase:  TraceDelete,
+					Title:  "Слот стал empty",
+					Detail: "В группе уже был empty, значит удаление не оборвёт чужую последовательность поиска.",
+					Tone:   TraceSuccess,
+					Target: slotTarget(tableID(table), groupIndex, slotIndex),
+				})
+			} else {
+				slot.Control = ctrlDeleted
+				s.trace = append(s.trace, TraceStep{
+					Phase:  TraceDelete,
+					Title:  "Оставлен tombstone",
+					Detail: "Группа была полной: deleted сохраняет непрерывность последовательности проб для ключей, лежащих дальше.",
+					Tone:   TraceWarning,
+					Target: slotTarget(tableID(table), groupIndex, slotIndex),
+				})
+			}
+			return
+		}
+
+		if firstEmpty(group) >= 0 {
+			break
+		}
+
+		probeStep++
+		groupIndex = GroupIndex((int(groupIndex) + probeStep) & groupMask)
+	}
+
+	s.trace = append(s.trace, TraceStep{
+		Phase:  TraceDelete,
+		Title:  "Ключ не найден",
+		Detail: "Первый empty завершил поиск; map не изменилась.",
+		Tone:   TraceWarning,
+	})
+}
+
+// rehash выбирает один из двух вариантов роста конкретной таблицы.
+//
+// Пока удвоенная ёмкость не превышает учебный предел, таблица заменяется одной
+// таблицей вдвое больше. На предельной ёмкости она разделяется на две таблицы, а
+// directory начинает различать их дополнительным старшим битом хеша.
+func (s *Swiss) rehash(oldTable *swissTable) {
+	oldEntries := tableEntries(oldTable)
+	if oldTable.Capacity*2 <= s.maxTableCapacity {
+		replacement := s.newTable(
+			oldTable.Capacity*2,
+			oldTable.Index,
+			oldTable.LocalDepth,
+		)
+
+		moves := make([]string, 0, len(oldEntries))
+		for _, entry := range oldEntries {
+			groupIndex, slotIndex := s.uncheckedInsert(replacement, entry)
+			moves = append(moves, fmt.Sprintf("%d→g%d/s%d", entry.Key, groupIndex, slotIndex))
+		}
+
+		for directoryIndex, table := range s.directory {
+			if table == oldTable {
+				s.directory[directoryIndex] = replacement
+			}
+		}
+
+		s.trace = append(s.trace, TraceStep{
+			Phase: TraceGrow,
+			Title: fmt.Sprintf(
+				"%s выросла %d → %d",
+				tableID(oldTable),
+				oldTable.Capacity,
+				replacement.Capacity,
+			),
+			Detail: fmt.Sprintf(
+				"Вся выбранная таблица синхронно перехеширована одной записью. Перемещено %d пар: %s.",
+				len(oldEntries),
+				compactMoves(moves),
+			),
+			Tone:   TraceWarning,
+			Target: tableID(replacement),
+		})
+		return
+	}
+
+	s.splitTable(oldTable, oldEntries)
+}
+
+// splitTable заменяет одну предельную таблицу двумя таблицами той же ёмкости.
+//
+// Если localDepth старой таблицы уже равен globalDepth, directory сначала
+// удваивается. Затем дополнительный старший бит хеша распределяет ссылки
+// директории и старые пары между левой и правой таблицами.
+func (s *Swiss) splitTable(oldTable *swissTable, entries []*swissEntry) {
+	newLocalDepth := oldTable.LocalDepth + 1
+	if oldTable.LocalDepth == s.globalDepth {
+		expandedDirectory := make([]*swissTable, 0, len(s.directory)*2)
+		for _, table := range s.directory {
+			expandedDirectory = append(expandedDirectory, table, table)
+		}
+		s.directory = expandedDirectory
+		s.globalDepth++
+		s.reindexTables()
+		s.trace = append(s.trace, TraceStep{
+			Phase:  TraceDirectory,
+			Title:  "Директория удвоилась",
+			Detail: fmt.Sprintf("globalDepth стал %d, поэтому теперь используются %d маршрутов по старшим битам.", s.globalDepth, len(s.directory)),
+			Tone:   TraceWarning,
+			Target: "directory",
+		})
+	}
+
+	leftTable := s.newTable(s.maxTableCapacity, -1, newLocalDepth)
+	rightTable := s.newTable(s.maxTableCapacity, -1, newLocalDepth)
+
+	for directoryIndex, table := range s.directory {
+		if table != oldTable {
+			continue
+		}
+
+		splitBit := (directoryIndex >> (s.globalDepth - newLocalDepth)) & 1
+		if splitBit == 0 {
+			s.directory[directoryIndex] = leftTable
+		} else {
+			s.directory[directoryIndex] = rightTable
+		}
+	}
+	s.reindexTables()
+
+	// Маска выбирает новый старший бит префикса. Ноль оставляет запись слева,
+	// единица направляет её в правую таблицу.
+	splitMask := FullHash(1) << (64 - newLocalDepth)
+	for _, entry := range entries {
+		targetTable := leftTable
+		if entry.Hash&splitMask != 0 {
+			targetTable = rightTable
+		}
+		s.uncheckedInsert(targetTable, entry)
+	}
+
+	s.trace = append(s.trace, TraceStep{
+		Phase: TraceSplit,
+		Title: fmt.Sprintf(
+			"%s разделилась на %s и %s",
+			tableID(oldTable),
+			tableID(leftTable),
+			tableID(rightTable),
+		),
+		Detail: fmt.Sprintf("Перемещено %d пар. Дополнительный старший бит префикса определил левую или правую таблицу; старый объект больше не установлен в директории.", len(entries)),
+		Tone:   TraceWarning,
+		Target: "directory",
+	})
+}
+
+// pruneTombstones очищает таблицу без увеличения её ёмкости.
+//
+// Такая перестройка имеет смысл только при заметном количестве deleted-слотов:
+// здесь используется учебный порог 10 процентов ёмкости. Все живые пары
+// вставляются в новый объект таблицы, после чего ссылки directory заменяются.
 func (s *Swiss) pruneTombstones(table *swissTable) bool {
-	tombs := tableTombstones(table)
-	if tombs == 0 || tombs*10 < table.Capacity {
+	tombstones := tableTombstones(table)
+	if tombstones == 0 || tombstones*10 < table.Capacity {
 		return false
 	}
+
 	entries := tableEntries(table)
 	replacement := s.newTable(table.Capacity, table.Index, table.LocalDepth)
 	for _, entry := range entries {
 		s.uncheckedInsert(replacement, entry)
 	}
-	for i, current := range s.directory {
-		if current == table {
-			s.directory[i] = replacement
+	for directoryIndex, currentTable := range s.directory {
+		if currentTable == table {
+			s.directory[directoryIndex] = replacement
 		}
 	}
 	return true
 }
 
-func (s *Swiss) newTable(capacity, index, depth int) *swissTable {
+// newTable создаёт пустую таблицу заданной ёмкости и инициализирует все её
+// группы управляющими байтами ctrlEmpty.
+func (s *Swiss) newTable(
+	capacity TableCapacity,
+	directoryIndex DirectoryIndex,
+	localDepth HashDepth,
+) *swissTable {
 	table := &swissTable{
-		ID: s.nextTableID, Capacity: capacity, LocalDepth: depth, Index: index,
+		ID:         s.nextTableID,
+		Capacity:   capacity,
+		LocalDepth: localDepth,
+		Index:      directoryIndex,
 		GrowthLeft: maxGrowthLeft(capacity),
-		Groups:     make([]swissGroup, capacity/groupSlots),
+		Groups:     make([]swissGroup, capacity/swissGroupSlots),
 	}
 	s.nextTableID++
+
 	for groupIndex := range table.Groups {
 		table.Groups[groupIndex] = *newSwissGroup()
 	}
 	return table
 }
 
-func (s *Swiss) uncheckedInsert(table *swissTable, entry *swissEntry) (int, int) {
-	mask := len(table.Groups) - 1
-	offset, step := int(h1(entry.Hash))&mask, 0
+// uncheckedInsert размещает уже проверенную уникальную запись во время
+// внутренней перестройки.
+//
+// Функция не ищет существующий ключ и не запускает новый grow: вызывающий код
+// заранее создал таблицу достаточной ёмкости и передаёт только живые уникальные
+// пары. Возвращаемые индексы используются для учебного описания перемещений.
+func (s *Swiss) uncheckedInsert(
+	table *swissTable,
+	entry *swissEntry,
+) (GroupIndex, SlotIndex) {
+	groupMask := len(table.Groups) - 1
+	groupIndex := GroupIndex(int(h1(entry.Hash)) & groupMask)
+	probeStep := 0
+
 	for {
-		group := &table.Groups[offset]
-		idx := firstAvailable(group)
-		if idx >= 0 {
-			copyEntry := *entry
-			group.Slots[idx] = swissSlot{Control: h2(entry.Hash), Entry: &copyEntry}
+		group := &table.Groups[groupIndex]
+		slotIndex := firstAvailable(group)
+		if slotIndex >= 0 {
+			entryCopy := *entry
+			group.Slots[slotIndex] = swissSlot{
+				Control: ControlByte(h2(entry.Hash)),
+				Entry:   &entryCopy,
+			}
 			table.Used++
 			table.GrowthLeft--
-			return offset, idx
+			return groupIndex, slotIndex
 		}
-		step++
-		offset = (offset + step) & mask
+
+		probeStep++
+		groupIndex = GroupIndex((int(groupIndex) + probeStep) & groupMask)
 	}
 }
 
-func (s *Swiss) directoryIndex(hash uint64) int {
+// directoryIndex извлекает globalDepth старших битов полного хеша.
+//
+// При globalDepth == 0 существует единственный маршрут с индексом 0.
+func (s *Swiss) directoryIndex(hash FullHash) DirectoryIndex {
 	if s.globalDepth == 0 {
 		return 0
 	}
-	return int(hash >> (64 - s.globalDepth))
+	return DirectoryIndex(hash >> (64 - s.globalDepth))
 }
 
+// reindexTables записывает в каждую уникальную таблицу первую позицию, с которой
+// она встречается в directory. Индекс используется только для стабильного
+// отображения и сортировки таблиц в интерфейсе.
 func (s *Swiss) reindexTables() {
 	seen := make(map[*swissTable]bool)
-	for i, table := range s.directory {
-		if !seen[table] {
-			table.Index = i
-			seen[table] = true
+	for directoryIndex, table := range s.directory {
+		if seen[table] {
+			continue
 		}
+		table.Index = directoryIndex
+		seen[table] = true
 	}
 }
 
-func (s *Swiss) traceHash(key int, hash uint64, action string) {
+// traceHash добавляет в трассировку объяснение разделения полного хеша на H1 и
+// H2 для выбранной операции.
+func (s *Swiss) traceHash(key MapKey, hash FullHash, kind OperationKind) {
 	s.trace = append(s.trace, TraceStep{
-		Phase: "hash", Title: fmt.Sprintf("Ключ %d хешируется для операции «%s»", key, action),
-		Detail:  fmt.Sprintf("hash = 0x%016x; H2 = 0x%02x хранится в control byte, H1 = 0x%x задаёт начало probe sequence.", hash, h2(hash), h1(hash)),
-		Formula: fmt.Sprintf("H1 = hash >> 7; H2 = hash & 0x7f = 0x%02x", h2(hash)),
-		Tone:    "info",
+		Phase:  TraceHash,
+		Title:  fmt.Sprintf("Ключ %d хешируется для операции «%s»", key, operationName(kind)),
+		Detail: fmt.Sprintf("hash = 0x%016x; H2 = 0x%02x хранится в управляющем байте, H1 = 0x%x задаёт начало последовательности проб.", hash, h2(hash), h1(hash)),
+		Formula: fmt.Sprintf(
+			"H1 = hash >> 7; H2 = hash & 0x7f = 0x%02x",
+			h2(hash),
+		),
+		Tone: TraceInfo,
 	})
 }
 
-func (s *Swiss) mark(table string, group, slot int) {
+// mark запоминает физический слот, который нужно подсветить в следующем снимке.
+func (s *Swiss) mark(table TableID, group GroupIndex, slot SlotIndex) {
 	s.lastTargets[slotTarget(table, group, slot)] = true
 }
 
+// Snapshot преобразует внутреннее состояние модели в стабильную JSON-модель
+// интерфейса. Внутренние указатели таблиц наружу не передаются.
 func (s *Swiss) Snapshot() Snapshot {
 	snapshot := Snapshot{
-		Mode: "swiss", Title: "Современная map: Swiss Table",
-		Subtitle: "Go 1.24+ · группы по 8 слотов · H1/H2 · quadratic probing · extendible hashing",
-		Notice:   "Рост одной таблицы выполняется синхронно внутри вызвавшей его записи. «Инкрементальность» достигается тем, что большая map разбита на независимые таблицы.",
-		Trace:    s.trace, EventCount: s.events,
-		ScaleNote: fmt.Sprintf("Учебный предел таблицы: %d слотов. В реальном Go 1.25 предел равен 1024; уменьшение нужно только для быстрой демонстрации split.", s.maxTableCapacity),
+		Mode:       ModeSwiss,
+		Title:      "Современная map: Swiss Table",
+		Subtitle:   "Go 1.24+ · группы по 8 слотов · H1/H2 · quadratic probing · extendible hashing",
+		Notice:     "Рост одной таблицы выполняется синхронно внутри вызвавшей его записи. «Инкрементальность» достигается тем, что большая map разбита на независимые таблицы.",
+		Trace:      s.trace,
+		EventCount: s.events,
+		ScaleNote:  fmt.Sprintf("Учебный предел таблицы: %d слотов. В настоящем runtime предел равен 1024; уменьшение нужно только для быстрой демонстрации split.", s.maxTableCapacity),
 	}
 
 	if s.small != nil {
@@ -519,69 +849,94 @@ func (s *Swiss) Snapshot() Snapshot {
 			{Label: "Элементы", Value: fmt.Sprint(s.used), Hint: "Число заполненных слотов"},
 			{Label: "Режим", Value: "small map", Hint: "dirPtr указывает прямо на одну группу"},
 			{Label: "Группы", Value: "1 × 8", Hint: "Директории ещё нет"},
-			{Label: "Load", Value: fmt.Sprintf("%d/8", s.used), Hint: "Девятая новая пара создаст таблицу"},
+			{Label: "Загрузка", Value: fmt.Sprintf("%d/8", s.used), Hint: "Девятая новая пара создаст таблицу"},
 		}
 		snapshot.Tables = []TableView{{
-			ID: "small", Used: s.used, Capacity: 8, GrowthLeft: 8 - s.used,
-			Groups: []GroupView{s.groupView("small", 0, s.small)},
+			ID:         smallTableID,
+			Used:       s.used,
+			Capacity:   swissGroupSlots,
+			GrowthLeft: swissGroupSlots - s.used,
+			Groups:     []GroupView{s.groupView(smallTableID, 0, s.small)},
 		}}
 		return snapshot
 	}
 
 	unique := uniqueTables(s.directory)
-	totalCapacity, totalGrowth := 0, 0
+	totalCapacity := TableCapacity(0)
+	totalGrowth := GrowthBudget(0)
 	for _, table := range unique {
 		totalCapacity += table.Capacity
 		totalGrowth += table.GrowthLeft
 		snapshot.Tables = append(snapshot.Tables, s.tableView(table))
 	}
+
 	snapshot.Stats = []Stat{
 		{Label: "Элементы", Value: fmt.Sprint(s.used), Hint: "Map.used по всем таблицам"},
 		{Label: "Таблицы", Value: fmt.Sprint(len(unique)), Hint: "Независимо растущие Swiss tables"},
 		{Label: "Ёмкость", Value: fmt.Sprint(totalCapacity), Hint: "Физические слоты всех уникальных таблиц"},
-		{Label: "growthLeft", Value: fmt.Sprint(totalGrowth), Hint: "Сколько empty ещё можно занять до rehash"},
-		{Label: "globalDepth", Value: fmt.Sprint(s.globalDepth), Hint: "Число верхних бит для директории"},
+		{Label: "growthLeft", Value: fmt.Sprint(totalGrowth), Hint: "Сколько empty ещё можно занять до перестройки"},
+		{Label: "globalDepth", Value: fmt.Sprint(s.globalDepth), Hint: "Число старших бит для директории"},
 	}
 
-	counts := make(map[*swissTable]int)
+	referenceCounts := make(map[*swissTable]int)
 	for _, table := range s.directory {
-		counts[table]++
+		referenceCounts[table]++
 	}
-	for i, table := range s.directory {
+	for directoryIndex, table := range s.directory {
 		snapshot.Directory = append(snapshot.Directory, DirectoryView{
-			Index: i, Bits: bitString(i, s.globalDepth), Table: tableID(table), Shared: counts[table] > 1,
+			Index:  directoryIndex,
+			Bits:   bitString(directoryIndex, s.globalDepth),
+			Table:  tableID(table),
+			Shared: referenceCounts[table] > 1,
 		})
 	}
 	return snapshot
 }
 
+// tableView преобразует одну внутреннюю таблицу в представление для браузера.
 func (s *Swiss) tableView(table *swissTable) TableView {
 	view := TableView{
-		ID: tableID(table), Used: table.Used, Capacity: table.Capacity,
-		GrowthLeft: table.GrowthLeft, Tombstones: tableTombstones(table),
-		LocalDepth: table.LocalDepth, DirectoryAt: table.Index,
+		ID:          tableID(table),
+		Used:        table.Used,
+		Capacity:    table.Capacity,
+		GrowthLeft:  table.GrowthLeft,
+		Tombstones:  tableTombstones(table),
+		LocalDepth:  table.LocalDepth,
+		DirectoryAt: table.Index,
 	}
-	for index := range table.Groups {
-		view.Groups = append(view.Groups, s.groupView(tableID(table), index, &table.Groups[index]))
+	for groupIndex := range table.Groups {
+		view.Groups = append(
+			view.Groups,
+			s.groupView(tableID(table), groupIndex, &table.Groups[groupIndex]),
+		)
 	}
 	return view
 }
 
-func (s *Swiss) groupView(table string, index int, group *swissGroup) GroupView {
-	view := GroupView{Index: index}
-	control := ""
+// groupView расшифровывает управляющие байты и пары одной физической группы.
+func (s *Swiss) groupView(
+	table TableID,
+	groupIndex GroupIndex,
+	group *swissGroup,
+) GroupView {
+	view := GroupView{Index: groupIndex}
+	controlWord := ""
+
 	for slotIndex, slot := range group.Slots {
-		state, label := "empty", "80"
+		state, label := SlotEmpty, "80"
 		if slot.Control == ctrlDeleted {
-			state, label = "deleted", "fe"
+			state, label = SlotDeleted, "fe"
 		} else if slot.Entry != nil {
-			state, label = "full", fmt.Sprintf("%02x", slot.Control)
+			state, label = SlotFull, fmt.Sprintf("%02x", slot.Control)
 		}
-		control += label
+
+		controlWord += label
 		slotView := SlotView{
-			Index: slotIndex, State: state, Control: "0x" + label,
-			Highlight:  s.lastTargets[slotTarget(table, index, slotIndex)],
-			PhysicalID: slotTarget(table, index, slotIndex),
+			Index:      slotIndex,
+			State:      state,
+			Control:    "0x" + label,
+			Highlight:  s.lastTargets[slotTarget(table, groupIndex, slotIndex)],
+			PhysicalID: slotTarget(table, groupIndex, slotIndex),
 		}
 		if slot.Entry != nil {
 			slotView.Key = intPtr(slot.Entry.Key)
@@ -589,56 +944,75 @@ func (s *Swiss) groupView(table string, index int, group *swissGroup) GroupView 
 		}
 		view.Slots = append(view.Slots, slotView)
 	}
-	view.ControlWord = "0x" + control
+
+	view.ControlWord = "0x" + controlWord
 	return view
 }
 
+// newSwissGroup создаёт группу, в которой каждый слот помечен настоящим empty.
 func newSwissGroup() *swissGroup {
 	group := &swissGroup{}
-	for i := range group.Slots {
-		group.Slots[i].Control = ctrlEmpty
+	for slotIndex := range group.Slots {
+		group.Slots[slotIndex].Control = ctrlEmpty
 	}
 	return group
 }
 
-func findInGroup(group *swissGroup, key int, control byte) int {
-	for i, slot := range group.Slots {
-		if slot.Entry != nil && slot.Control == control && slot.Entry.Key == key {
-			return i
+// findInGroup ищет ключ среди кандидатов с совпавшим H2.
+//
+// Возвращает -1, если ни один занятый слот не прошёл и быстрый фильтр H2, и
+// полное сравнение ключа.
+func findInGroup(
+	group *swissGroup,
+	key MapKey,
+	fingerprint ControlFingerprint,
+) SlotIndex {
+	for slotIndex, slot := range group.Slots {
+		if slot.Entry != nil &&
+			slot.Control == ControlByte(fingerprint) &&
+			slot.Entry.Key == key {
+			return slotIndex
 		}
 	}
 	return -1
 }
 
-func firstAvailable(group *swissGroup) int {
-	for i, slot := range group.Slots {
+// firstAvailable возвращает первый слот, пригодный для записи: настоящий empty
+// либо tombstone. Наличие tombstone само по себе не завершает поиск ключа.
+func firstAvailable(group *swissGroup) SlotIndex {
+	for slotIndex, slot := range group.Slots {
 		if slot.Entry == nil && (slot.Control == ctrlEmpty || slot.Control == ctrlDeleted) {
-			return i
+			return slotIndex
 		}
 	}
 	return -1
 }
 
-func firstEmpty(group *swissGroup) int {
-	for i, slot := range group.Slots {
+// firstEmpty возвращает индекс первого настоящего empty. Именно такой слот
+// является доказательством, что искомого ключа дальше по цепочке нет.
+func firstEmpty(group *swissGroup) SlotIndex {
+	for slotIndex, slot := range group.Slots {
 		if slot.Entry == nil && slot.Control == ctrlEmpty {
-			return i
+			return slotIndex
 		}
 	}
 	return -1
 }
 
+// groupEntries возвращает независимые копии всех живых записей группы.
 func groupEntries(group *swissGroup) []*swissEntry {
 	var entries []*swissEntry
 	for _, slot := range group.Slots {
-		if slot.Entry != nil {
-			copyEntry := *slot.Entry
-			entries = append(entries, &copyEntry)
+		if slot.Entry == nil {
+			continue
 		}
+		entryCopy := *slot.Entry
+		entries = append(entries, &entryCopy)
 	}
 	return entries
 }
 
+// tableEntries собирает живые записи всех групп таблицы.
 func tableEntries(table *swissTable) []*swissEntry {
 	var entries []*swissEntry
 	for groupIndex := range table.Groups {
@@ -647,8 +1021,10 @@ func tableEntries(table *swissTable) []*swissEntry {
 	return entries
 }
 
-func tableTombstones(table *swissTable) int {
-	count := 0
+// tableTombstones считает удалённые слоты, которые всё ещё занимают место в
+// последовательностях проб.
+func tableTombstones(table *swissTable) ElementCount {
+	count := ElementCount(0)
 	for groupIndex := range table.Groups {
 		for _, slot := range table.Groups[groupIndex].Slots {
 			if slot.Entry == nil && slot.Control == ctrlDeleted {
@@ -659,42 +1035,58 @@ func tableTombstones(table *swissTable) int {
 	return count
 }
 
-func maxGrowthLeft(capacity int) int {
-	if capacity <= groupSlots {
+// maxGrowthLeft вычисляет число настоящих empty, которые можно занять до
+// перестройки. Для полноценной таблицы используется предельная загрузка 7/8.
+func maxGrowthLeft(capacity TableCapacity) GrowthBudget {
+	if capacity <= swissGroupSlots {
 		return capacity
 	}
 	return capacity * 7 / 8
 }
 
+// uniqueTables удаляет повторяющиеся указатели из directory и сортирует таблицы
+// по их первой позиции для стабильного отображения.
 func uniqueTables(directory []*swissTable) []*swissTable {
 	seen := make(map[*swissTable]bool)
 	var result []*swissTable
 	for _, table := range directory {
-		if table != nil && !seen[table] {
-			seen[table] = true
-			result = append(result, table)
+		if table == nil || seen[table] {
+			continue
 		}
+		seen[table] = true
+		result = append(result, table)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Index < result[j].Index })
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Index < result[j].Index
+	})
 	return result
 }
 
-func tableID(table *swissTable) string {
-	return fmt.Sprintf("T%d", table.ID)
+// tableID возвращает короткое стабильное имя таблицы для интерфейса.
+func tableID(table *swissTable) TableID {
+	return TableID(fmt.Sprintf("T%d", table.ID))
 }
 
-func groupTarget(table *swissTable, group int) string {
-	return fmt.Sprintf("%s-g%d", tableID(table), group)
+// groupTarget строит идентификатор группы для подсветки в браузере.
+func groupTarget(table *swissTable, group GroupIndex) UIObjectID {
+	return UIObjectID(fmt.Sprintf("%s-g%d", tableID(table), group))
 }
 
-func slotTarget(table string, group, slot int) string {
-	return fmt.Sprintf("%s-g%d-s%d", table, group, slot)
+// slotTarget строит идентификатор физического слота для подсветки в браузере.
+func slotTarget(table TableID, group GroupIndex, slot SlotIndex) UIObjectID {
+	return UIObjectID(fmt.Sprintf("%s-g%d-s%d", table, group, slot))
 }
 
+// compactMoves сокращает длинный список перемещений, чтобы учебная трассировка
+// оставалась читаемой даже при большой таблице.
 func compactMoves(moves []string) string {
-	const limit = 12
-	if len(moves) <= limit {
+	const visibleMoveLimit = 12
+	if len(moves) <= visibleMoveLimit {
 		return fmt.Sprint(moves)
 	}
-	return fmt.Sprintf("%v … и ещё %d", moves[:limit], len(moves)-limit)
+	return fmt.Sprintf(
+		"%v … и ещё %d",
+		moves[:visibleMoveLimit],
+		len(moves)-visibleMoveLimit,
+	)
 }
