@@ -18,7 +18,11 @@ import (
 )
 
 const (
+	// realGroupSlots — количество физических слотов в группе настоящей map[int]int.
 	realGroupSlots = 8
+
+	// realCtrlEmpty и realCtrlDelete повторяют служебные значения управляющих
+	// байтов текущего runtime.
 	realCtrlEmpty  = byte(0x80)
 	realCtrlDelete = byte(0xfe)
 )
@@ -27,7 +31,8 @@ const (
 //
 // Порядок и размеры полей критичны: значение типа map фактически содержит
 // указатель на такую структуру runtime. Любое расхождение с установленной версией
-// Go делает чтение некорректным, поэтому этот код нельзя переносить в production.
+// Go делает чтение некорректным, поэтому этот код нельзя переносить в рабочие
+// программы.
 type mapHeaderMirror struct {
 	Used              uint64
 	Seed              uintptr
@@ -132,7 +137,7 @@ func (l *Lab) Snapshot() lab.Snapshot {
 	return snapshot
 }
 
-// capture читает заголовок Map и преобразует directory, table и group в
+// capture читает заголовок Map и преобразует директорию, таблицы и группы в
 // безопасную JSON-модель лаборатории.
 func (l *Lab) capture() lab.Snapshot {
 	header := *(**mapHeaderMirror)(unsafe.Pointer(&l.data))
@@ -140,7 +145,7 @@ func (l *Lab) capture() lab.Snapshot {
 		Mode:      lab.ModeReal,
 		Title:     "Живой unsafe-инспектор",
 		Subtitle:  fmt.Sprintf("%s · %s/%s · фактическая Swiss Table в памяти", runtime.Version(), runtime.GOOS, runtime.GOARCH),
-		Notice:    "В современной реализации нет hmap.B, oldbuckets и nevacuate. Инспектор показывает Map, directory, table, group и настоящие управляющие байты.",
+		Notice:    "В современной реализации нет hmap.B, oldbuckets и nevacuate. Инспектор показывает Map, директорию, таблицы, группы и настоящие управляющие байты.",
 		ScaleNote: "Внутренняя раскладка runtime не является публичным API Go. Этот режим предназначен только для обучения.",
 	}
 	if header == nil {
@@ -178,7 +183,7 @@ func (l *Lab) capture() lab.Snapshot {
 }
 
 // captureDirectory читает массив указателей таблиц, учитывая, что несколько
-// элементов directory могут ссылаться на один физический объект table.
+// элементов директории могут ссылаться на один физический объект table.
 func captureDirectory(header *mapHeaderMirror, snapshot *lab.Snapshot) {
 	directory := unsafe.Slice((**tableMirror)(header.DirPtr), header.DirLen)
 	tableIDs := make(map[*tableMirror]lab.TableID)
@@ -206,8 +211,8 @@ func captureDirectory(header *mapHeaderMirror, snapshot *lab.Snapshot) {
 		})
 	}
 
-	// Map iteration does not гарантирует порядок, поэтому уникальные таблицы
-	// сортируются по их позиции Index перед построением интерфейса.
+	// Обход map не гарантирует порядок, поэтому уникальные таблицы сортируются по
+	// их позиции Index перед построением интерфейса.
 	type observedTable struct {
 		table *tableMirror
 		id    lab.TableID
@@ -388,7 +393,7 @@ func capacities(snapshot lab.Snapshot) string {
 	return fmt.Sprint(values)
 }
 
-// realBitString форматирует префикс directory с фиксированной шириной.
+// realBitString форматирует префикс директории с фиксированной шириной.
 func realBitString(value, width int) string {
 	if width == 0 {
 		return "—"
