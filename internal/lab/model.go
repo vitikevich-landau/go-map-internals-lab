@@ -1,7 +1,7 @@
 // Package lab содержит детерминированные и безопасные для памяти модели двух
 // реализаций map в Go: современной Swiss Table и классической бакетной map.
 //
-// Пакет намеренно не использует unsafe. Чтение настоящего layout runtime
+// Пакет намеренно не использует unsafe. Чтение настоящей раскладки runtime
 // изолировано в internal/inspector, поэтому алгоритмы здесь можно изучать,
 // проверять и изменять без привязки к конкретному выпуску Go.
 package lab
@@ -58,8 +58,8 @@ type SlotView struct {
 
 // GroupView представляет одну группу Swiss Table из восьми слотов.
 //
-// ControlWord объединяет восемь control bytes в их физическом порядке, а Slots
-// содержит уже расшифрованное представление, удобное для браузера.
+// ControlWord объединяет восемь управляющих байтов в их физическом порядке, а
+// Slots содержит уже расшифрованное представление, удобное для браузера.
 type GroupView struct {
 	Index       GroupIndex `json:"index"`
 	ControlWord string     `json:"controlWord"`
@@ -91,10 +91,11 @@ type DirectoryView struct {
 	Shared bool           `json:"shared"`
 }
 
-// BucketView представляет основной legacy-бакет вместе с его overflow-цепочкой.
+// BucketView представляет основной legacy-бакет вместе с его цепочкой
+// переполнения.
 //
-// Chain[0] — основной bmap. Последующие элементы — overflow-bmap, достижимые по
-// ссылкам, похожим на ссылки внутри runtime.
+// Chain[0] — основной bmap. Последующие элементы — дополнительные bmap,
+// достижимые по ссылкам, похожим на ссылки внутри runtime.
 type BucketView struct {
 	Index     BucketIndex  `json:"index"`
 	Evacuated bool         `json:"evacuated"`
